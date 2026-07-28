@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          BINARY="rungpu-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "${BINARY}" .
+          echo "BINARY=${BINARY}" >> $GITHUB_ENV
+
+      - name: Create archive
+        run: |
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            zip "${{ env.BINARY }}.zip" "${{ env.BINARY }}"
+            echo "ARCHIVE=${{ env.BINARY }}.zip" >> $GITHUB_ENV
+          else
+            tar czf "${{ env.BINARY }}.tar.gz" "${{ env.BINARY }}"
+            echo "ARCHIVE=${{ env.BINARY }}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect archives
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release/ \;
+          ls -lh release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RunGPU Agent ${{ github.ref_name }}
+          body: |
+            ## RunGPU GPU Agent ${{ github.ref_name }}
+
+            Cross-platform GPU agent for the [RunGPU](https://www.rungpu.io) P2P GPU marketplace.
+
+            ### Downloads
+
+            | Platform | Architecture | Download |
+            |----------|-------------|----------|
+            | Linux | x86_64 (AMD/Intel) | `rungpu-agent-linux-amd64.tar.gz` |
+            | Linux | ARM64 (Raspberry Pi, AWS Graviton) | `rungpu-agent-linux-arm64.tar.gz` |
+            | macOS | Intel | `rungpu-agent-darwin-amd64.tar.gz` |
+            | macOS | Apple Silicon (M1/M2/M3/M4) | `rungpu-agent-darwin-arm64.tar.gz` |
+            | Windows | x86_64 | `rungpu-agent-windows-amd64.zip` |
+
+            ### Quick Start
+
+            ```bash
+            # Download and extract (example: macOS Apple Silicon)
+            tar xzf rungpu-agent-darwin-arm64.tar.gz
+            chmod +x rungpu-agent-darwin-arm64
+
+            # Initialize with your API key
+            ./rungpu-agent-darwin-arm64 init --api-key YOUR_API_KEY
+
+            # Start earning
+            ./rungpu-agent-darwin-arm64 start
+            ```
+
+            Get your API key at [rungpu.io/marketplace/host](https://www.rungpu.io/marketplace/host)
+
+            ### Verify Download
+
+            ```bash
+            sha256sum -c checksums.txt
+            ```
+
+            See [README](https://github.com/RunGPU-io/gpu-agent#readme) for full documentation.
+          files: release/*
+          draft: false
+          prerelease: false

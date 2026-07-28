@@ -1,0 +1,39 @@
+RunGPU Source Available License
+
+Copyright (c) 2025 RunGPU. All rights reserved.
+
+Permission is hereby granted to view and inspect the source code of this
+software ("Software") solely for the purpose of auditing the code that runs
+on your machine as a GPU host on the RunGPU platform.
+
+The following restrictions apply:
+
+1. NO REDISTRIBUTION. You may not distribute, publish, sublicense, or share
+   the Software or any portion thereof, in source or compiled form, to any
+   third party.
+
+2. NO MODIFICATION. You may not modify, adapt, translate, or create
+   derivative works based on the Software for any purpose other than
+   contributing back to this repository via pull request.
+
+3. NO COMMERCIAL USE. You may not use the Software, in whole or in part, to
+   build, operate, or offer any competing product or service.
+
+4. NO COPYING. You may not copy, reproduce, or extract any portion of the
+   Software into another project, product, or codebase.
+
+5. PERMITTED USE. You may:
+   (a) View and read the source code for security auditing purposes.
+   (b) Build and run the Software solely to participate as a GPU host on
+       the RunGPU platform (https://www.rungpu.io).
+   (c) Submit bug reports and pull requests to this repository.
+
+6. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY
+   CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+7. TERMINATION. This license is automatically terminated if you violate any
+   of the above terms. Upon termination, you must destroy all copies of the
+   Software in your possession.
+
+For licensing inquiries, contact: legal@rungpu.io
