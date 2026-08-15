@@ -3,7 +3,7 @@ package dockermgr
 import (
 	"testing"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestPolicyFromConfig(t *testing.T) {

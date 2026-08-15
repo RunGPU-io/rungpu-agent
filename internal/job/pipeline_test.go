@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestResolveImage(t *testing.T) {
@@ -32,29 +34,29 @@ func TestResolveImage(t *testing.T) {
 			"img:v2", false,
 		},
 		{
-			"well-known ltx-video routes to ComfyUI",
+			"ltx-video requires explicit batch worker",
 			types.JobAssignment{ModelName: "ltx-video"},
-			"ghcr.io/ai-dock/comfyui:latest", false,
+			"", true,
 		},
 		{
-			"well-known wan2 routes to ComfyUI",
+			"wan2 requires explicit batch worker",
 			types.JobAssignment{ModelName: "wan2"},
-			"ghcr.io/ai-dock/comfyui:latest", false,
+			"", true,
 		},
 		{
-			"well-known comfyui",
+			"comfyui batch requires explicit worker",
 			types.JobAssignment{ModelName: "comfyui"},
-			"ghcr.io/ai-dock/comfyui:latest", false,
+			"", true,
 		},
 		{
-			"HuggingFace URL",
+			"HuggingFace URL requires explicit worker",
 			types.JobAssignment{ModelName: "test", ModelURL: "https://huggingface.co/spaces/org/model"},
-			"registry.hf.space/org-model", false,
+			"", true,
 		},
 		{
-			"HuggingFace repo style",
+			"HuggingFace repo style requires explicit worker",
 			types.JobAssignment{ModelName: "stabilityai/stable-diffusion-xl"},
-			"registry.hf.space/stabilityai-stable-diffusion-xl", false,
+			"", true,
 		},
 		{
 			"unknown model no slash",
@@ -101,8 +103,8 @@ func TestValidateCustomFileURL(t *testing.T) {
 	untrusted := []struct{ url, path string }{
 		{"https://evil.io/malware.safetensors", "models/m.safetensors"},
 		{"https://randomsite.com/lora.safetensors", "models/lora.safetensors"},
-		{"http://huggingface.co/model.safetensors", "models/m.safetensors"},  // HTTP not HTTPS
-		{"ftp://huggingface.co/model.safetensors", "models/m.safetensors"},   // FTP
+		{"http://huggingface.co/model.safetensors", "models/m.safetensors"}, // HTTP not HTTPS
+		{"ftp://huggingface.co/model.safetensors", "models/m.safetensors"},  // FTP
 	}
 	for _, tc := range untrusted {
 		if err := ValidateCustomFileURL(tc.url, tc.path); err == nil {
@@ -174,6 +176,36 @@ func TestDownloadCustomFilesEmpty(t *testing.T) {
 	err := DownloadCustomFiles(context.Background(), nil, t.TempDir(), nil)
 	if err != nil {
 		t.Errorf("empty files should not error: %v", err)
+	}
+}
+
+func TestEnsureCachedFileDownloadsOnceConcurrently(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		_, _ = w.Write([]byte("shared asset"))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "asset.safetensors")
+	var workers sync.WaitGroup
+	errors := make(chan error, 8)
+	for index := 0; index < 8; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			errors <- ensureCachedFile(context.Background(), server.URL, cachePath)
+		}()
+	}
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("network requests=%d, want 1", got)
 	}
 }
 
@@ -385,6 +417,49 @@ func TestExecutorRejectsUntrustedCustomFileURL(t *testing.T) {
 	}
 	if !strings.Contains(result.Error, "not from a trusted source") {
 		t.Errorf("error should mention trusted source: %s", result.Error)
+	}
+}
+
+func TestPruneCustomAssetsUsesTTLAndLRU(t *testing.T) {
+	cacheDir := t.TempDir()
+	now := time.Now()
+	old := now.Add(-8 * 24 * time.Hour)
+	middle := now.Add(-2 * time.Hour)
+	recent := now.Add(-time.Hour)
+
+	oldAsset := filepath.Join(cacheDir, "assets", "old.safetensors")
+	middleAsset := filepath.Join(cacheDir, "assets", "middle.safetensors")
+	recentAsset := filepath.Join(cacheDir, "assets", "recent.safetensors")
+	for _, path := range []string{oldAsset, middleAsset, recentAsset} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("asset"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, modified := range map[string]time.Time{oldAsset: old, middleAsset: middle, recentAsset: recent} {
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files, bytes, err := PruneCustomAssets(cacheDir, 7*24*time.Hour, 5, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files != 2 || bytes != 10 {
+		t.Fatalf("removed files=%d bytes=%d, want 2 and 10", files, bytes)
+	}
+	for _, path := range []string{oldAsset, middleAsset} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expired path still exists: %s", path)
+		}
+	}
+	for _, path := range []string{recentAsset} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("recent path was removed: %s: %v", path, err)
+		}
 	}
 }
 

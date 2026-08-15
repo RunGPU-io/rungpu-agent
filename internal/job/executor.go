@@ -5,17 +5,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // Executor orchestrates a single job through the full pipeline:
-//   1. Resolve Docker image
-//   2. Pull image (cached)
-//   3. Download custom files (LoRAs, workflows)
-//   4. Run inference
-//   5. Upload outputs
-//   6. Return result
+//  1. Resolve Docker image
+//  2. Pull image (cached)
+//  3. Download custom files (LoRAs, workflows)
+//  4. Run inference
+//  5. Upload outputs
+//  6. Return result
 //
 // Progress is reported via the optional OnProgress callback so the pool client
 // can relay it to the coordinator (and thus to the user's browser).
@@ -24,6 +24,7 @@ type Executor struct {
 	gpuID      string
 	backend    string
 	cacheDir   string
+	jobTimeout time.Duration
 	OnProgress func(types.JobProgress) // set by pool client
 
 	// Teardown/tracking: `inflight` holds cancel funcs for jobs currently
@@ -59,6 +60,9 @@ func NewExecutor(cacheDir string, maxCacheGB int, gpuID, backend string) (*Execu
 // NewExecutorWithOptions builds an executor whose Runtime matches the backend,
 // honoring GPU scoping, job timeout, and download caps.
 func NewExecutorWithOptions(o ExecutorOptions) (*Executor, error) {
+	if o.JobTimeout <= 0 {
+		o.JobTimeout = 60 * time.Minute
+	}
 	rt, err := NewRuntimeOpts(o.Backend, o.CacheDir, o.MaxCacheGB, RuntimeOptions{
 		GPUDevice:  o.GPUDevice,
 		JobTimeout: o.JobTimeout,
@@ -74,14 +78,25 @@ func NewExecutorWithOptions(o ExecutorOptions) (*Executor, error) {
 		gpuID:      o.GPUID,
 		backend:    o.Backend,
 		cacheDir:   o.CacheDir,
+		jobTimeout: o.JobTimeout,
 		inflight:   map[string]context.CancelFunc{},
 		workspaces: map[string]bool{},
 		teardown:   dockermgr.New(),
 	}, nil
 }
 
-func (e *Executor) Backend() string  { return e.backend }
-func (e *Executor) Runtime() string  { return e.runtime.Name() }
+func (e *Executor) Backend() string { return e.backend }
+func (e *Executor) Runtime() string { return e.runtime.Name() }
+
+func (e *Executor) WorkspaceIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ids := make([]string, 0, len(e.workspaces))
+	for id := range e.workspaces {
+		ids = append(ids, id)
+	}
+	return ids
+}
 
 // Execute runs a single job end-to-end and returns a JobResult ready to send.
 func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.JobResult {
@@ -93,6 +108,15 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	jobCtx, cancel := context.WithCancel(ctx)
 	e.trackInflight(a.JobID, cancel)
 	workspace := isWorkspaceJob(a)
+	if !workspace {
+		jobTimeout := e.jobTimeout
+		if jobTimeout <= 0 {
+			jobTimeout = 60 * time.Minute
+		}
+		var timeoutCancel context.CancelFunc
+		jobCtx, timeoutCancel = context.WithTimeout(jobCtx, jobTimeout)
+		defer timeoutCancel()
+	}
 	defer func() {
 		e.untrackInflight(a.JobID)
 		// Keep workspace containers registered on success so they can be torn
@@ -108,12 +132,12 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	if len(a.CustomFiles) > 0 {
 		e.progress(a.JobID, "downloading_files", 0, "Downloading custom files...")
 		stagingDir := e.cacheDir + "/staging/" + a.JobID
-		if err := DownloadCustomFiles(ctx, a.CustomFiles, stagingDir, func(stage string, pct float64, msg string) {
+		if err := DownloadCustomFilesCached(ctx, a.CustomFiles, stagingDir, e.cacheDir+"/assets", func(stage string, pct float64, msg string) {
 			e.progress(a.JobID, stage, pct, msg)
 		}); err != nil {
 			res.Success = false
 			res.Error = "custom file download failed: " + err.Error()
-			res.DurationMS = time.Since(start).Milliseconds()
+			res.DurationMS = elapsedMilliseconds(start)
 			return res
 		}
 	}
@@ -123,14 +147,14 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	if err := e.runtime.Prepare(ctx, a); err != nil {
 		res.Success = false
 		res.Error = "model preparation failed: " + err.Error()
-		res.DurationMS = time.Since(start).Milliseconds()
+		res.DurationMS = elapsedMilliseconds(start)
 		return res
 	}
 
 	// ── Stage 3: Run inference ──────────────────────────────────────────
 	e.progress(a.JobID, "running", 0.5, "Running inference...")
 	out, err := e.runtime.Run(ctx, a)
-	res.DurationMS = time.Since(start).Milliseconds()
+	res.DurationMS = elapsedMilliseconds(start)
 	if err != nil {
 		res.Success = false
 		res.Error = err.Error()
@@ -161,6 +185,11 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 		res.Result = map[string]interface{}{"status": "completed"}
 	}
 	return res
+}
+
+func elapsedMilliseconds(start time.Time) int64 {
+	elapsed := time.Since(start)
+	return (elapsed.Nanoseconds() + int64(time.Millisecond) - 1) / int64(time.Millisecond)
 }
 
 func (e *Executor) progress(jobID, stage string, pct float64, msg string) {
@@ -210,6 +239,10 @@ func (e *Executor) markWorkspace(jobID string) {
 // Cancel stops a running job and tears down any container it started
 // (batch or workspace). Idempotent and safe to call for unknown job ids.
 func (e *Executor) Cancel(jobID string) {
+	e.cancelWithContext(context.Background(), jobID)
+}
+
+func (e *Executor) cancelWithContext(ctx context.Context, jobID string) {
 	e.mu.Lock()
 	if cancel, ok := e.inflight[jobID]; ok {
 		cancel()
@@ -223,8 +256,10 @@ func (e *Executor) Cancel(jobID string) {
 	if e.teardown == nil {
 		e.teardown = dockermgr.New()
 	}
-	ctx := context.Background()
 	for _, name := range []string{CustomContainerName(jobID), WorkspaceContainerName(jobID)} {
+		if ctx.Err() != nil {
+			return
+		}
 		_ = e.teardown.Stop(ctx, name)
 		_ = e.teardown.Remove(ctx, name)
 	}
@@ -244,6 +279,6 @@ func (e *Executor) StopAll(ctx context.Context) {
 	e.mu.Unlock()
 
 	for id := range ids {
-		e.Cancel(id)
+		e.cancelWithContext(ctx, id)
 	}
 }

@@ -15,6 +15,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - name: Audit public source boundary
+        run: ./scripts/audit-public.sh
       - name: Build
         run: go build -v ./...
       - name: Vet
@@ -26,3 +28,39 @@ jobs:
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null .
           GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null .
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null .
+
+  runtime-smoke:
+    name: Real Runtime Inference
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Verify Docker
+        run: docker version
+      - name: Clean Linux install and service-user inference
+        run: ./scripts/test-clean-ollama-linux.sh
+      - name: Install Ollama on runner
+        run: sudo ./scripts/install-ollama-linux.sh
+      - name: Native and Docker inference
+        env:
+          RUNGPU_RUNTIME_SMOKE: '1'
+        run: go test -v -count=1 -run '^TestRuntimeSmoke_' ./internal/job -timeout 20m
+
+  macos-runtime-smoke:
+    name: macOS Install and Inference
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Install Ollama with Homebrew
+        run: brew list ollama >/dev/null 2>&1 || brew install ollama
+      - name: Native agent inference
+        env:
+          RUNGPU_RUNTIME_SMOKE: '1'
+        run: go test -v -count=1 -run '^TestRuntimeSmoke_NativeOllamaInference$' ./internal/job -timeout 15m

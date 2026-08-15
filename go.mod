@@ -1,4 +1,4 @@
-module github.com/RunGPU-io/gpu-agent
+module github.com/RunGPU-io/rungpu-agent
 
 go 1.22
 

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 const defaultOllamaEndpoint = "http://localhost:11434"
@@ -211,6 +211,9 @@ func installOllamaDarwin(ctx context.Context) error {
 
 // installOllamaLinux installs Ollama on Linux using the official install script.
 func installOllamaLinux(ctx context.Context) error {
+	if output, err := exec.Command("id", "-u").Output(); err == nil && strings.TrimSpace(string(output)) != "0" {
+		return fmt.Errorf("automatic Ollama installation on Linux requires root privileges; reinstall the agent with sudo ./scripts/install.sh")
+	}
 	return installOllamaViaScript(ctx)
 }
 
@@ -257,7 +260,7 @@ func installOllamaViaScript(ctx context.Context) error {
 
 	// Verify installation
 	if _, err := exec.LookPath("ollama"); err != nil {
-		return fmt.Errorf("Ollama was installed but binary not found in PATH\n"+
+		return fmt.Errorf("Ollama was installed but binary not found in PATH\n" +
 			"  Try restarting your terminal or install manually: https://ollama.com/download")
 	}
 
@@ -295,6 +298,9 @@ func (r *ollamaRuntime) Prepare(ctx context.Context, a types.JobAssignment) erro
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ollama pull %s failed: %w", model, err)
+	}
+	if err := trackManagedAsset(r.cacheDir, "ollama", model); err != nil {
+		return fmt.Errorf("track pulled Ollama model %s: %w", model, err)
 	}
 	return nil
 }

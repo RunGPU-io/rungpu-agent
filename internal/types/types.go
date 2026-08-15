@@ -10,23 +10,27 @@ type MetricsConfig struct {
 }
 
 type SecurityConfig struct {
-	AllowAnyImage     bool     `yaml:"allow_any_image"`      // if true, skip image allowlist (DANGEROUS)
-	TrustedRegistries []string `yaml:"trusted_registries"`   // additional trusted registries
-	MaxMemoryGB       int      `yaml:"max_memory_gb"`        // container memory limit (0 = no limit)
-	MaxCPUs           float64  `yaml:"max_cpus"`             // container CPU limit (0 = no limit)
-	AllowHostNetwork  bool     `yaml:"allow_host_network"`   // if true, run containers with --network host (DANGEROUS)
-	HFToken           string   `yaml:"hf_token"`             // HuggingFace access token for gated models
+	AllowAnyImage     bool     `yaml:"allow_any_image"`    // if true, skip image allowlist (DANGEROUS)
+	TrustedRegistries []string `yaml:"trusted_registries"` // additional trusted registries
+	MaxMemoryGB       int      `yaml:"max_memory_gb"`      // container memory limit (0 = no limit)
+	MaxCPUs           float64  `yaml:"max_cpus"`           // container CPU limit (0 = no limit)
+	AllowHostNetwork  bool     `yaml:"allow_host_network"` // if true, run containers with --network host (DANGEROUS)
+	HFToken           string   `yaml:"-"`                  // runtime-only HuggingFace token from HF_TOKEN
 }
 
 type Config struct {
-	APIKey                string         `yaml:"api_key"`
-	PoolURL               string         `yaml:"pool_url"`
-	GPUIDs                []string       `yaml:"gpu_ids"`
-	PricePerMinute        float64        `yaml:"price_per_minute"`
-	ModelCacheDir         string         `yaml:"model_cache_dir"`
-	MaxModelCacheGB       int            `yaml:"max_model_cache_gb"`
-	CleanupIntervalHours  int            `yaml:"cleanup_interval_hours"`
-	HeartbeatIntervalSecs int            `yaml:"heartbeat_interval_secs"`
+	APIKey                string   `yaml:"api_key"`
+	MachineID             string   `yaml:"machine_id"`
+	PoolURL               string   `yaml:"pool_url"`
+	GPUIDs                []string `yaml:"gpu_ids"`
+	PricePerMinute        float64  `yaml:"price_per_minute"`
+	ModelCacheDir         string   `yaml:"model_cache_dir"`
+	MaxModelCacheGB       int      `yaml:"max_model_cache_gb"`
+	CleanupIntervalHours  int      `yaml:"cleanup_interval_hours"`
+	CustomAssetTTLDays    int      `yaml:"custom_asset_ttl_days"`
+	MaxCustomAssetCacheGB int      `yaml:"max_custom_asset_cache_gb"`
+	HeartbeatIntervalSecs int      `yaml:"heartbeat_interval_secs"`
+	AllowCPUServing       bool     `yaml:"allow_cpu_serving"`
 
 	// GPUDevice scopes containers to a specific GPU passed to `docker --gpus`.
 	// Empty or "all" exposes every GPU; otherwise it is passed as
@@ -36,7 +40,7 @@ type Config struct {
 
 	// JobTimeoutMinutes caps how long a batch (non-workspace) job may run before
 	// the container is killed. 0 → default (60 minutes). A job may request a
-	// shorter/longer value via Parameters["timeout_minutes"].
+	// shorter value via Parameters["timeout_minutes"].
 	JobTimeoutMinutes int `yaml:"job_timeout_minutes"`
 
 	// MaxCustomFileGB caps the size of any single downloaded custom file
@@ -115,6 +119,24 @@ type JobControl struct {
 	JobID string `json:"job_id"`
 }
 
+type AssetCleanupRequest struct {
+	Type       string   `json:"type"`
+	RequestID  string   `json:"request_id"`
+	Phase      string   `json:"phase"`
+	Categories []string `json:"categories"`
+}
+
+type AssetCleanupResult struct {
+	Type       string                 `json:"type"`
+	RequestID  string                 `json:"request_id"`
+	Phase      string                 `json:"phase"`
+	Success    bool                   `json:"success"`
+	Error      string                 `json:"error,omitempty"`
+	Categories map[string]interface{} `json:"categories,omitempty"`
+	TotalBytes int64                  `json:"total_bytes,omitempty"`
+	ActiveJobs int                    `json:"active_jobs,omitempty"`
+}
+
 // CustomFile is a file to download and inject into the container.
 type CustomFile struct {
 	URL  string `json:"url"`  // download URL (HuggingFace, Civitai, direct link)
@@ -135,12 +157,12 @@ type JobResult struct {
 
 // JobProgress is sent periodically while a job is running.
 type JobProgress struct {
-	Type       string  `json:"type"` // "job_progress"
-	JobID      string  `json:"job_id"`
-	GPUID      string  `json:"gpu_id"`
-	Stage      string  `json:"stage"`   // "pulling_image" | "downloading_files" | "running" | "uploading"
-	Progress   float64 `json:"progress"` // 0.0 - 1.0
-	Message    string  `json:"message"`
+	Type     string  `json:"type"` // "job_progress"
+	JobID    string  `json:"job_id"`
+	GPUID    string  `json:"gpu_id"`
+	Stage    string  `json:"stage"`    // "pulling_image" | "downloading_files" | "running" | "uploading"
+	Progress float64 `json:"progress"` // 0.0 - 1.0
+	Message  string  `json:"message"`
 }
 
 // RegisterMessage announces a GPU to the pool. api_key is injected server-side
@@ -148,7 +170,8 @@ type JobProgress struct {
 type RegisterMessage struct {
 	Type           string   `json:"type"` // "gpu_register"
 	GPUID          string   `json:"gpu_id"`
-	Hostname       string   `json:"hostname"`
+	MachineID      string   `json:"machine_id,omitempty"`
+	DeviceIndex    int      `json:"device_index"`
 	GPUType        string   `json:"gpu_type"`
 	Backend        string   `json:"backend"` // "cuda" | "metal" | "cpu"
 	VRAMGB         float64  `json:"vram_gb"`
@@ -156,15 +179,9 @@ type RegisterMessage struct {
 	ModelsCached   []string `json:"models_cached"`
 	DriverVersion  string   `json:"driver_version"`
 
-	// ── Host system info (so coordinator knows full capabilities) ────────
-	CPUModel       string   `json:"cpu_model,omitempty"`       // e.g. "Apple M3 Pro", "AMD EPYC 7763"
-	CPUCores       int      `json:"cpu_cores,omitempty"`       // logical cores
-	RAMTotalGB     float64  `json:"ram_total_gb,omitempty"`    // total system RAM
-	OSInfo         string   `json:"os_info,omitempty"`         // e.g. "darwin/arm64", "linux/amd64"
-
 	// ── Runtime capabilities (what job types this host can serve) ────────
-	Capabilities   []string `json:"capabilities,omitempty"`    // ["ollama","docker","workspace"]
-	OllamaModels   []string `json:"ollama_models,omitempty"`   // models pulled in Ollama (not just cache dir)
+	Capabilities []string `json:"capabilities,omitempty"`  // ["ollama","docker","workspace"]
+	OllamaModels []string `json:"ollama_models,omitempty"` // models pulled in Ollama (not just cache dir)
 }
 
 // HeartbeatMessage reports liveness and current availability.
@@ -175,9 +192,5 @@ type HeartbeatMessage struct {
 	CurrentJobs     int      `json:"current_jobs"`
 	ModelsCached    []string `json:"models_cached"`
 
-	// ── Live system metrics ─────────────────────────────────────────────
-	RAMUsedGB       float64  `json:"ram_used_gb,omitempty"`
-	RAMTotalGB      float64  `json:"ram_total_gb,omitempty"`
-	CPUPercent      float64  `json:"cpu_percent,omitempty"`     // 0-100
-	OllamaModels    []string `json:"ollama_models,omitempty"`   // current Ollama model list
+	OllamaModels []string `json:"ollama_models,omitempty"` // current Ollama model list
 }

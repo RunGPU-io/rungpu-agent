@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // workspaceRuntime runs long-lived interactive containers (ComfyUI, Jupyter,
@@ -17,14 +18,14 @@ import (
 //
 // Storage strategy — Docker named volumes for persistence:
 //
-//   Models, custom nodes, and other large assets are stored in Docker named
-//   volumes (e.g. "tokenize-comfyui-models"). These survive container removal
-//   and are reused across jobs, so a 10 GB SDXL checkpoint downloaded once is
-//   available instantly for every subsequent job. The host never re-downloads
-//   models it already has.
+//	Models, custom nodes, and other large assets are stored in Docker named
+//	volumes (e.g. "tokenize-comfyui-models"). These survive container removal
+//	and are reused across jobs, so a 10 GB SDXL checkpoint downloaded once is
+//	available instantly for every subsequent job. The host never re-downloads
+//	models it already has.
 //
-//   Per-job workspace data (user files, outputs) uses a separate bind mount
-//   so it can be cleaned up when the rental ends.
+//	Per-job workspace data (user files, outputs) uses a separate bind mount
+//	so it can be cleaned up when the rental ends.
 //
 // The renter specifies:
 //   - docker_image: the full environment (e.g. "comfyanonymous/comfyui:latest")
@@ -129,8 +130,9 @@ func resolveWorkspace(a types.JobAssignment) (image string, ports []string, shmS
 		params = map[string]interface{}{}
 	}
 
-	// Explicit docker_image always wins
-	if img, ok := params["docker_image"].(string); ok && img != "" {
+	if a.DockerImage != "" {
+		image = a.DockerImage
+	} else if img, ok := params["docker_image"].(string); ok && img != "" {
 		image = img
 	}
 
@@ -145,15 +147,15 @@ func resolveWorkspace(a types.JobAssignment) (image string, ports []string, shmS
 		}
 	}
 
-	// Override ports from params
-	if p, ok := params["ports"].(string); ok && p != "" {
+	if len(a.Ports) > 0 {
+		ports = append([]string(nil), a.Ports...)
+	} else if p, ok := params["ports"].(string); ok && p != "" {
 		ports = strings.Split(p, ",")
-		for i := range ports {
-			ports[i] = strings.TrimSpace(ports[i])
-			// If user just says "8188", expand to "8188:8188"
-			if !strings.Contains(ports[i], ":") {
-				ports[i] = ports[i] + ":" + ports[i]
-			}
+	}
+	for i := range ports {
+		ports[i] = strings.TrimSpace(ports[i])
+		if !strings.Contains(ports[i], ":") {
+			ports[i] = ports[i] + ":" + ports[i]
 		}
 	}
 
@@ -239,6 +241,10 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 	// Per-job workspace bind mount (user files, scratch space)
 	workspaceDir := r.cacheDir + "/workspaces/" + a.JobID
 	mounts := []string{workspaceDir + ":/workspace"}
+	if len(a.CustomFiles) > 0 {
+		stagingDir := filepath.Join(r.cacheDir, "staging", a.JobID)
+		mounts = append(mounts, stagingDir+":/custom:ro")
+	}
 
 	// Persistent Docker named volumes — survive container removal.
 	// Models, custom nodes, extensions, etc. are stored here so they

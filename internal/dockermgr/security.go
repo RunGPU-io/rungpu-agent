@@ -8,12 +8,12 @@
 //   - Mount sensitive host paths (/etc, /root, /var/run/docker.sock)
 //
 // Mitigations:
-//   1. Image allowlist — only trusted registries (HuggingFace, our GHCR, Docker Hub official)
-//   2. Container sandboxing — no --privileged, no host network, no host PID
-//   3. Mount restrictions — only agent-controlled paths, never host system dirs
-//   4. Resource limits — CPU, memory, timeout
-//   5. Read-only root filesystem option
-//   6. No new privileges (security-opt)
+//  1. Image allowlist — only trusted registries (HuggingFace, our GHCR, Docker Hub official)
+//  2. Container sandboxing — no --privileged, no host network, no host PID
+//  3. Mount restrictions — only agent-controlled paths, never host system dirs
+//  4. Resource limits — CPU, memory, timeout
+//  5. Read-only root filesystem option
+//  6. No new privileges (security-opt)
 package dockermgr
 
 import (
@@ -21,21 +21,21 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // TrustedRegistries are the only registries we allow images from.
 // Images from other registries are rejected unless the host opts in.
 var TrustedRegistries = []string{
-	"ghcr.io/tokenize/",       // our pre-built model images
-	"ghcr.io/ai-dock/",        // ComfyUI, A1111 community images
-	"ghcr.io/invoke-ai/",      // InvokeAI
-	"registry.hf.space/",      // HuggingFace Spaces
-	"docker.io/library/",      // Docker Hub official images
-	"jupyter/",                 // Jupyter official
-	"pytorch/",                 // PyTorch official
-	"nvcr.io/nvidia/",         // NVIDIA NGC
-	"atinoda/",                 // text-generation-webui
+	"ghcr.io/tokenize/",  // our pre-built model images
+	"ghcr.io/ai-dock/",   // ComfyUI, A1111 community images
+	"ghcr.io/invoke-ai/", // InvokeAI
+	"registry.hf.space/", // HuggingFace Spaces
+	"docker.io/library/", // Docker Hub official images
+	"jupyter/",           // Jupyter official
+	"pytorch/",           // PyTorch official
+	"nvcr.io/nvidia/",    // NVIDIA NGC
+	"atinoda/",           // text-generation-webui
 }
 
 // BlockedMountPaths are host paths that must NEVER be mounted into a container.
@@ -59,23 +59,23 @@ var BlockedMountPaths = []string{
 
 // SecurityPolicy controls what containers are allowed to do.
 type SecurityPolicy struct {
-	AllowAnyImage    bool     // if true, skip image allowlist (host opts in to risk)
+	AllowAnyImage     bool     // if true, skip image allowlist (host opts in to risk)
 	TrustedRegistries []string // additional trusted registries beyond defaults
-	MaxMemoryGB      int      // container memory limit (0 = no limit)
-	MaxCPUs          float64  // container CPU limit (0 = no limit)
-	TimeoutMinutes   int      // max container runtime (0 = no limit)
-	AllowHostNetwork bool     // if true, allow --network host (dangerous)
+	MaxMemoryGB       int      // container memory limit (0 = no limit)
+	MaxCPUs           float64  // container CPU limit (0 = no limit)
+	TimeoutMinutes    int      // max container runtime (0 = no limit)
+	AllowHostNetwork  bool     // if true, allow --network host (dangerous)
 }
 
 // DefaultPolicy returns a secure default policy.
 func DefaultPolicy() SecurityPolicy {
 	return SecurityPolicy{
-		AllowAnyImage:    false,
+		AllowAnyImage:     false,
 		TrustedRegistries: nil,
-		MaxMemoryGB:      0,  // no limit by default (host controls via config)
-		MaxCPUs:          0,
-		TimeoutMinutes:   0,
-		AllowHostNetwork: false,
+		MaxMemoryGB:       16,
+		MaxCPUs:           2,
+		TimeoutMinutes:    60,
+		AllowHostNetwork:  false,
 	}
 }
 
@@ -161,8 +161,8 @@ func isAgentControlledPath(hostPath string) bool {
 // These are always applied — the renter cannot override them.
 func SandboxArgs(policy SecurityPolicy) []string {
 	args := []string{
-		"--security-opt", "no-new-privileges",  // prevent privilege escalation
-		"--pids-limit", "4096",                  // prevent fork bombs
+		"--security-opt", "no-new-privileges", // prevent privilege escalation
+		"--pids-limit", "4096", // prevent fork bombs
 	}
 
 	// Only opt into host networking when explicitly allowed; otherwise the

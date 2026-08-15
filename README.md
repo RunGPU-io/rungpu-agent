@@ -9,12 +9,12 @@ List your GPU, earn money when others rent it. Source available so you can audit
 ## Quick Start
 
 1. Go to [rungpu.io/marketplace/host](https://www.rungpu.io/marketplace/host) and list your GPU
-2. Copy your API key
+2. Create a one-time enrollment token for this machine
 3. Download the agent for your platform from [Releases](https://github.com/RunGPU-io/rungpu-agent/releases)
 4. Run:
 
 ```bash
-./rungpu-agent init --api-key YOUR_API_KEY
+./rungpu-agent init --enrollment-token YOUR_ONE_TIME_TOKEN
 ./rungpu-agent start
 ```
 
@@ -26,20 +26,20 @@ Run in the background with auto-restart on boot:
 
 ```bash
 # macOS
-./scripts/install-macos.sh YOUR_API_KEY
+./scripts/install-macos.sh
 
 # Linux
 sudo ./scripts/install.sh
 
 # Windows
-.\scripts\install.ps1 -ApiKey "YOUR_API_KEY"
+.\scripts\install.ps1
 ```
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `rungpu-agent init --api-key KEY` | Set up the agent |
+| `rungpu-agent init --enrollment-token TOKEN` | Enroll this machine |
 | `rungpu-agent start` | Start earning |
 | `rungpu-agent status` | Check GPU status |
 | `rungpu-agent cleanup` | Remove agent data |
@@ -51,6 +51,22 @@ sudo ./scripts/install.sh
 - **10 GB disk space**
 
 Apple Silicon Macs are supported via Ollama.
+
+## Asset Retention
+
+Downloaded LoRAs, checkpoints, and workflows are cached for seven days after
+their last use, with a default 20 GB cache budget. Reusing an asset refreshes
+its age. When over budget, least-recently-used assets are removed first.
+Automatic cleanup runs only while every GPU on the machine is idle and never
+removes outputs, workspaces, configuration, or the durable result outbox.
+
+Configure the policy in `~/.tokenize/config.yaml`:
+
+```yaml
+cleanup_interval_hours: 24
+custom_asset_ttl_days: 7 # -1 disables age-based removal
+max_custom_asset_cache_gb: 20 # -1 disables size-based LRU eviction
+```
 
 ## Security
 

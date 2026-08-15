@@ -3,9 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestSaveLoadRoundTrip(t *testing.T) {
@@ -14,12 +15,15 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 
 	original := &types.Config{
 		APIKey:                "key-abc",
+		MachineID:             "49c6e0e1-75c7-4fa2-a5cb-bb55ebcec900",
 		PoolURL:               "http://localhost:3001",
 		GPUIDs:                []string{"gpu-0", "gpu-1"},
 		PricePerMinute:        0.05,
 		ModelCacheDir:         "/tmp/models",
 		MaxModelCacheGB:       50,
 		CleanupIntervalHours:  12,
+		CustomAssetTTLDays:    3,
+		MaxCustomAssetCacheGB: 8,
 		HeartbeatIntervalSecs: 15,
 		Metrics:               types.MetricsConfig{EnableGPUMonitoring: true, MonitoringIntervalSecs: 7},
 	}
@@ -33,9 +37,12 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 
 	if loaded.APIKey != original.APIKey ||
+		loaded.MachineID != original.MachineID ||
 		loaded.PoolURL != original.PoolURL ||
 		loaded.PricePerMinute != original.PricePerMinute ||
 		loaded.MaxModelCacheGB != original.MaxModelCacheGB ||
+		loaded.CustomAssetTTLDays != original.CustomAssetTTLDays ||
+		loaded.MaxCustomAssetCacheGB != original.MaxCustomAssetCacheGB ||
 		len(loaded.GPUIDs) != 2 ||
 		loaded.GPUIDs[1] != "gpu-1" ||
 		loaded.Metrics.MonitoringIntervalSecs != 7 {
@@ -49,16 +56,19 @@ func TestValidate(t *testing.T) {
 		t.Errorf("expected valid config, got %v", err)
 	}
 
-	cases := map[string]*types.Config{
-		"missing api_key":      {PoolURL: "u", GPUIDs: []string{"g"}, MaxModelCacheGB: 1},
-		"missing pool_url":     {APIKey: "k", GPUIDs: []string{"g"}, MaxModelCacheGB: 1},
-		"no gpus":              {APIKey: "k", PoolURL: "u", MaxModelCacheGB: 1},
-		"zero cache":           {APIKey: "k", PoolURL: "u", GPUIDs: []string{"g"}},
+	if err := Validate(&types.Config{}); err == nil {
+		t.Error("missing api_key: expected validation error, got nil")
 	}
-	for name, cfg := range cases {
-		if err := Validate(cfg); err == nil {
-			t.Errorf("%s: expected validation error, got nil", name)
-		}
+	minimal := &types.Config{APIKey: "k"}
+	if err := Validate(minimal); err != nil {
+		t.Fatalf("minimal config should receive defaults: %v", err)
+	}
+	if minimal.MachineID == "" || len(minimal.GPUIDs) == 0 ||
+		minimal.JobTimeoutMinutes <= 0 || minimal.MaxCustomFileGB <= 0 ||
+		minimal.CustomAssetTTLDays != 7 ||
+		minimal.MaxCustomAssetCacheGB != 20 ||
+		minimal.Security.MaxMemoryGB <= 0 || minimal.Security.MaxCPUs <= 0 {
+		t.Errorf("security and identity defaults were not applied: %+v", minimal)
 	}
 }
 
@@ -93,6 +103,27 @@ func TestSaveCreatesFileWith0600(t *testing.T) {
 	// On Windows, file permissions work differently — skip the check.
 	if perm&0o077 != 0 {
 		t.Errorf("config file permissions = %o, want 0600 (no group/other access)", perm)
+	}
+}
+
+func TestHFTokenIsRuntimeOnly(t *testing.T) {
+	t.Setenv("HF_TOKEN", "hf_runtime_secret")
+	cfg := &types.Config{APIKey: "key", Security: types.SecurityConfig{HFToken: "old-secret"}}
+	ApplyDefaults(cfg)
+	if cfg.Security.HFToken != "hf_runtime_secret" {
+		t.Fatal("HF_TOKEN was not loaded from the process environment")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := Save(cfg, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(data), "hf_runtime_secret") || strings.Contains(string(data), "old-secret") {
+		t.Fatal("Hugging Face token was persisted to config")
 	}
 }
 

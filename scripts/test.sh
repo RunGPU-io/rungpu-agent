@@ -26,7 +26,7 @@ NC='\033[0m' # No Color
 # ── Parse flags ──────────────────────────────────────────────────────────────
 VERBOSE=""
 RACE=""
-RUN=""
+RUN=()
 COVER=""
 SHORT=""
 INTEGRATION=""
@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -run|--run)
-            RUN="-run $2"
+            RUN=(-run "$2")
             shift 2
             ;;
         -cover|--cover)
@@ -88,8 +88,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # If --integration, filter to integration test names
-if [[ "$INTEGRATION" == "true" && -z "$RUN" ]]; then
-    RUN="-run TestFullOllamaLifecycle|TestConcurrentJob|TestServerRecovery|TestServerFlapping|TestExecutorFullPipeline_WithProgress|TestExecutorWithUpload_FullChain|TestExecutorWithCustomFiles_LoRA|TestE2E_|TestFullPipeline_|TestFullLifecycle|TestHuggingFace|TestCustomDocker|TestWellKnownModel|TestOllamaModel|TestE2E_RealAgent_"
+if [[ "$INTEGRATION" == "true" && ${#RUN[@]} -eq 0 ]]; then
+    RUN=(-run 'TestFullOllamaLifecycle|TestConcurrentJob|TestServerRecovery|TestServerFlapping|TestExecutorFullPipeline_WithProgress|TestExecutorWithUpload_FullChain|TestExecutorWithCustomFiles_LoRA|TestE2E_|TestFullPipeline_|TestFullLifecycle|TestHuggingFace|TestCustomDocker|TestWellKnownModel|TestOllamaModel|TestE2E_RealAgent_')
 fi
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ echo -e "${CYAN}Go:${NC}       $GO_VERSION"
 echo -e "${CYAN}Dir:${NC}      $(pwd)"
 
 # Show what we're running
-FLAGS="$VERBOSE $RACE $RUN $COVER $SHORT ${EXTRA_ARGS[*]:-}"
+FLAGS="$VERBOSE $RACE ${RUN[*]:-} $COVER $SHORT ${EXTRA_ARGS[*]:-}"
 FLAGS=$(echo "$FLAGS" | xargs)  # trim whitespace
 if [[ -n "$FLAGS" ]]; then
     echo -e "${CYAN}Flags:${NC}    $FLAGS"
@@ -132,10 +132,20 @@ START_TIME=$(date +%s)
 # Build the command
 # Note: 120s is enough for all tests EXCEPT TestE2E_RealAgent_OllamaInference
 # which may pull a 2GB model. Run that separately with -timeout 600s.
-CMD="go test ./... -timeout 120s $VERBOSE $RACE $RUN $COVER $SHORT ${EXTRA_ARGS[*]:-}"
+CMD=(go test ./... -timeout 120s)
+[[ -n "$VERBOSE" ]] && CMD+=("$VERBOSE")
+[[ -n "$RACE" ]] && CMD+=("$RACE")
+if [[ ${#RUN[@]} -gt 0 ]]; then
+    CMD+=("${RUN[@]}")
+fi
+[[ -n "$COVER" ]] && CMD+=("$COVER")
+[[ -n "$SHORT" ]] && CMD+=("$SHORT")
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    CMD+=("${EXTRA_ARGS[@]}")
+fi
 
 # Run it
-if eval "$CMD"; then
+if "${CMD[@]}"; then
     END_TIME=$(date +%s)
     ELAPSED=$((END_TIME - START_TIME))
     echo ""

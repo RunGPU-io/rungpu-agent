@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Installs the Tokenize GPU Agent (Go) on macOS as a launchd LaunchAgent.
-# Usage: ./scripts/install-macos.sh [API_KEY]
+# Enroll after installation with a one-time token from the host dashboard.
 #
 # On Apple Silicon Macs, the agent runs inference via Ollama (Metal backend).
 # On Intel Macs, the agent runs inference via Ollama (CPU backend).
@@ -11,7 +11,6 @@ BIN_NAME="tokenize-gpu-agent"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 LABEL="com.tokenize.gpu-agent"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-API_KEY="${1:-}"
 
 # ── Platform checks ──────────────────────────────────────────────────────────
 
@@ -76,13 +75,6 @@ echo "Installing to $INSTALL_DIR (may require sudo)..."
 sudo mkdir -p "$INSTALL_DIR"
 sudo install -m 0755 "$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 
-# ── Init config ──────────────────────────────────────────────────────────────
-
-if [[ -n "$API_KEY" ]]; then
-    echo "Initializing config..."
-    "$INSTALL_DIR/$BIN_NAME" init --api-key "$API_KEY"
-fi
-
 # ── Show detected hardware ───────────────────────────────────────────────────
 
 echo ""
@@ -129,7 +121,6 @@ cat > "$PLIST" <<PLIST
 PLIST
 
 launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
@@ -147,9 +138,8 @@ echo "  Stop:    launchctl unload $PLIST"
 echo "  Start:   launchctl load $PLIST"
 echo "  Status:  $BIN_NAME status"
 echo ""
-if [[ -z "$API_KEY" ]]; then
-    echo "  ⚠️  Next: $BIN_NAME init --api-key YOUR_API_KEY"
-    echo ""
-fi
+echo "  Next:   $BIN_NAME init --enrollment-token YOUR_ONE_TIME_TOKEN"
+echo "  Then:   launchctl load $PLIST"
+echo ""
 echo "  Ensure Ollama is running: ollama serve"
 echo ""

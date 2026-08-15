@@ -1,7 +1,6 @@
 # Installs the Tokenize GPU Agent (Go) on Windows as a Scheduled Task.
-# Usage: powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 [-ApiKey KEY]
+# Enroll after installation with a one-time token from the host dashboard.
 param(
-    [string]$ApiKey = "",
     [string]$InstallDir = "$env:ProgramFiles\Tokenize"
 )
 
@@ -32,10 +31,6 @@ Pop-Location
 
 $BinPath = Join-Path $InstallDir $BinName
 
-if ($ApiKey -ne "") {
-    & $BinPath init --api-key $ApiKey
-}
-
 Write-Host "Registering Scheduled Task '$TaskName'..."
 $action  = New-ScheduledTaskAction -Execute $BinPath -Argument "start"
 $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -46,10 +41,7 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType S4U -
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
 
-Start-ScheduledTask -TaskName $TaskName
-
 Write-Host ""
 Write-Host "Installed. Manage with: Get-ScheduledTask -TaskName $TaskName"
-if ($ApiKey -eq "") {
-    Write-Host "Next: `"$BinPath`" init --api-key YOUR_API_KEY"
-}
+Write-Host "Next: `"$BinPath`" init --enrollment-token YOUR_ONE_TIME_TOKEN"
+Write-Host "Then: Start-ScheduledTask -TaskName $TaskName"

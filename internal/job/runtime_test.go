@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // ── Unit tests for pure functions ───────────────────────────────────────────
@@ -143,9 +143,9 @@ func TestDockerImageResolution(t *testing.T) {
 	}{
 		{"explicit DockerImage field", types.JobAssignment{DockerImage: "myimg:v1"}, "myimg:v1", false},
 		{"explicit param", types.JobAssignment{ModelName: "x", Parameters: map[string]interface{}{"docker_image": "myimg:v1"}}, "myimg:v1", false},
-		{"ltx-video routes to ComfyUI", types.JobAssignment{ModelName: "ltx-video"}, "ghcr.io/ai-dock/comfyui:latest", false},
-		{"wan2 routes to ComfyUI", types.JobAssignment{ModelName: "wan2"}, "ghcr.io/ai-dock/comfyui:latest", false},
-		{"HF repo style", types.JobAssignment{ModelName: "org/model"}, "registry.hf.space/org-model", false},
+		{"ltx-video requires worker", types.JobAssignment{ModelName: "ltx-video"}, "", true},
+		{"wan2 requires worker", types.JobAssignment{ModelName: "wan2"}, "", true},
+		{"HF repo style requires worker", types.JobAssignment{ModelName: "org/model"}, "", true},
 		{"unknown no slash", types.JobAssignment{ModelName: "llama2"}, "", true},
 	}
 	for _, tc := range cases {
@@ -197,6 +197,12 @@ func TestResolveWorkspace(t *testing.T) {
 	}
 	if len(ports2) != 1 || ports2[0] != "9090:9090" {
 		t.Errorf("ports = %v, want [9090:9090]", ports2)
+	}
+	img3, ports3, _, _, _ := resolveWorkspace(types.JobAssignment{
+		ModelName: "custom", DockerImage: "top-level:v2", Ports: []string{"8188"},
+	})
+	if img3 != "top-level:v2" || len(ports3) != 1 || ports3[0] != "8188:8188" {
+		t.Errorf("top-level workspace fields ignored: image=%q ports=%v", img3, ports3)
 	}
 }
 
@@ -315,10 +321,12 @@ func TestOllamaRuntimeServerDown(t *testing.T) {
 // skipPrepare wraps a runtime and skips Prepare (no real ollama in tests).
 type skipPrepare struct{ inner Runtime }
 
-func (s *skipPrepare) Name() string                                                          { return s.inner.Name() }
-func (s *skipPrepare) Prepare(_ context.Context, _ types.JobAssignment) error                { return nil }
-func (s *skipPrepare) Run(ctx context.Context, a types.JobAssignment) (map[string]interface{}, error) { return s.inner.Run(ctx, a) }
-func (s *skipPrepare) Cleanup(force bool) error                                              { return s.inner.Cleanup(force) }
+func (s *skipPrepare) Name() string                                           { return s.inner.Name() }
+func (s *skipPrepare) Prepare(_ context.Context, _ types.JobAssignment) error { return nil }
+func (s *skipPrepare) Run(ctx context.Context, a types.JobAssignment) (map[string]interface{}, error) {
+	return s.inner.Run(ctx, a)
+}
+func (s *skipPrepare) Cleanup(force bool) error { return s.inner.Cleanup(force) }
 
 func TestExecutorEndToEnd(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

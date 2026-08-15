@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 const workerImage = "tokenize-worker:latest"

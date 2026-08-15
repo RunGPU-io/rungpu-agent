@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestHeartbeatSent(t *testing.T) {
@@ -199,17 +199,16 @@ func TestRegisterMessageFormat(t *testing.T) {
 	if msg.Backend == "" {
 		t.Error("Backend empty")
 	}
-	if msg.Hostname == "" {
-		t.Error("Hostname empty")
-	}
-
 	data, _ := json.Marshal(msg)
 	var raw map[string]interface{}
 	json.Unmarshal(data, &raw)
-	for _, k := range []string{"type", "gpu_id", "hostname", "gpu_type", "backend", "vram_gb", "price_per_minute"} {
+	for _, k := range []string{"type", "gpu_id", "gpu_type", "backend", "vram_gb", "price_per_minute"} {
 		if _, ok := raw[k]; !ok {
 			t.Errorf("missing field %q", k)
 		}
+	}
+	if _, ok := raw["hostname"]; ok {
+		t.Error("registration must not expose the operating-system hostname")
 	}
 }
 

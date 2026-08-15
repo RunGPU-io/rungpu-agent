@@ -4,28 +4,35 @@
 //
 // Usage:
 //
-//	rungpu-agent init --api-key KEY [--config PATH]
+//	rungpu-agent init --enrollment-token TOKEN [--config PATH]
 //	rungpu-agent start [--config PATH]
 //	rungpu-agent status [--config PATH]
 //	rungpu-agent cleanup [--all] [--containers] [--volumes] [--images] [--cache] [--ollama] [--config-file] [--service] [--dry-run]
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/config"
-	"github.com/RunGPU-io/gpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/gpu-agent/internal/gpu"
-	"github.com/RunGPU-io/gpu-agent/internal/pool"
+	"github.com/RunGPU-io/rungpu-agent/internal/config"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
+	"github.com/RunGPU-io/rungpu-agent/internal/pool"
 )
 
 func main() {
@@ -80,12 +87,17 @@ Run "tokenize-gpu-agent <command> -h" for command flags.`)
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	apiKey := fs.String("api-key", "", "API key from your RunGPU account (required)")
+	enrollmentToken := fs.String("enrollment-token", "", "one-time fleet enrollment token")
+	poolURL := fs.String("pool-url", "https://pool.rungpu.io", "pool coordinator URL")
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 
-	if *apiKey == "" {
-		return fmt.Errorf("--api-key is required\n\nGet your API key from: https://www.rungpu.io/marketplace/host")
+	if *enrollmentToken == "" {
+		return fmt.Errorf("--enrollment-token is required")
+	}
+	enrolled, err := enrollMachine(*poolURL, *enrollmentToken)
+	if err != nil {
+		return err
 	}
 
 	fmt.Println()
@@ -190,16 +202,20 @@ func cmdInit(args []string) error {
 	fmt.Println("Step 3/4 — Creating configuration...")
 	fmt.Println()
 
-	cfg, err := config.New(*apiKey)
+	cfg, err := config.New(enrolled.AgentKey)
 	if err != nil {
 		return err
 	}
+	cfg.PoolURL = *poolURL
+	cfg.MachineID = enrolled.MachineID
+	cfg.PricePerMinute = enrolled.PricePerMinute
+	config.RefreshGPUIDs(cfg)
 	if err := config.Save(cfg, *cfgPath); err != nil {
 		return err
 	}
 	fmt.Printf("  ✅ Config saved to: %s\n", *cfgPath)
 	fmt.Printf("  ✅ Pool URL: %s\n", cfg.PoolURL)
-	fmt.Printf("  ✅ API key: %s...%s\n", (*apiKey)[:6], (*apiKey)[len(*apiKey)-4:])
+	fmt.Printf("  ✅ Machine ID: %s\n", cfg.MachineID)
 	fmt.Println()
 
 	// ── Step 4: Next steps ──────────────────────────────────────────────
@@ -224,6 +240,50 @@ func cmdInit(args []string) error {
 	return nil
 }
 
+type enrollmentResponse struct {
+	MachineID      string  `json:"machine_id"`
+	AgentKey       string  `json:"agent_key"`
+	PricePerMinute float64 `json:"price_per_minute"`
+}
+
+func enrollMachine(poolURL, token string) (*enrollmentResponse, error) {
+	base, err := url.Parse(poolURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pool URL: %w", err)
+	}
+	if base.Scheme != "https" {
+		host := base.Hostname()
+		ip := net.ParseIP(host)
+		if base.Scheme != "http" || (host != "localhost" && (ip == nil || !ip.IsLoopback())) {
+			return nil, fmt.Errorf("fleet enrollment requires HTTPS except on localhost")
+		}
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/api/v1/fleet/enroll"
+	body, _ := json.Marshal(map[string]string{"enrollment_token": token})
+	req, err := http.NewRequest(http.MethodPost, base.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fleet enrollment failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fleet enrollment rejected with HTTP %d", resp.StatusCode)
+	}
+	var result enrollmentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("invalid enrollment response: %w", err)
+	}
+	if result.MachineID == "" || result.AgentKey == "" {
+		return nil, fmt.Errorf("enrollment response is missing credentials")
+	}
+	return &result, nil
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // start
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -237,11 +297,17 @@ func cmdStart(args []string) error {
 	if err != nil {
 		return err
 	}
+	hadMachineID := cfg.MachineID != ""
 	if err := config.Validate(cfg); err != nil {
 		return err
 	}
+	if !hadMachineID {
+		if err := config.Save(cfg, *cfgPath); err != nil {
+			return fmt.Errorf("persist machine identity: %w", err)
+		}
+	}
 
-	client, err := pool.NewClient(cfg)
+	clients, err := pool.NewClients(cfg)
 	if err != nil {
 		return err
 	}
@@ -249,9 +315,25 @@ func cmdStart(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("Starting agent (pool: %s)...\n", cfg.PoolURL)
-	if err := client.Run(ctx); err != nil && err != context.Canceled {
-		return err
+	fmt.Printf("Starting %d GPU worker(s) (pool: %s)...\n", len(clients), cfg.PoolURL)
+	go pool.RunCustomAssetCleanup(ctx, cfg, clients)
+	var workers sync.WaitGroup
+	errCh := make(chan error, len(clients))
+	for _, client := range clients {
+		workers.Add(1)
+		go func(client *pool.Client) {
+			defer workers.Done()
+			if runErr := client.Run(ctx); runErr != nil && runErr != context.Canceled {
+				errCh <- runErr
+				stop()
+			}
+		}(client)
+	}
+	workers.Wait()
+	select {
+	case runErr := <-errCh:
+		return runErr
+	default:
 	}
 	fmt.Println("Agent stopped.")
 	return nil
@@ -907,4 +989,3 @@ func humanSize(bytes int64) string {
 		return fmt.Sprintf("%d B", bytes)
 	}
 }
-

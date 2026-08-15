@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RunGPU-io/gpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // customDockerRuntime runs jobs in a user-specified Docker image. Handles:
@@ -70,6 +70,9 @@ func (r *customDockerRuntime) Prepare(ctx context.Context, a types.JobAssignment
 		cmd := exec.CommandContext(ctx, "docker", "pull", img)
 		if out, pullErr := cmd.CombinedOutput(); pullErr != nil {
 			return fmt.Errorf("docker pull %s failed: %v: %s", img, pullErr, strings.TrimSpace(string(out)))
+		}
+		if err := trackManagedAsset(r.cacheDir, "docker", img); err != nil {
+			return fmt.Errorf("track pulled Docker image %s: %w", img, err)
 		}
 	}
 
@@ -174,25 +177,28 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 
 func (r *customDockerRuntime) Cleanup(force bool) error { return nil }
 
-// jobTimeoutFor returns the runtime's configured timeout, overridden by the
-// job's Parameters["timeout_minutes"] when present (JSON numbers decode to
-// float64; a string is also accepted).
+// jobTimeoutFor permits a renter to request a shorter timeout, never one above
+// the host-configured maximum.
 func (r *customDockerRuntime) jobTimeoutFor(a types.JobAssignment) time.Duration {
+	requested := time.Duration(0)
 	if a.Parameters != nil {
 		switch v := a.Parameters["timeout_minutes"].(type) {
 		case float64:
 			if v > 0 {
-				return time.Duration(v) * time.Minute
+				requested = time.Duration(v) * time.Minute
 			}
 		case int:
 			if v > 0 {
-				return time.Duration(v) * time.Minute
+				requested = time.Duration(v) * time.Minute
 			}
 		case string:
 			if mins, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && mins > 0 {
-				return time.Duration(mins) * time.Minute
+				requested = time.Duration(mins) * time.Minute
 			}
 		}
+	}
+	if requested > 0 && requested < r.jobTimeout {
+		return requested
 	}
 	return r.jobTimeout
 }

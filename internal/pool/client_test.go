@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestEndpoint(t *testing.T) {
@@ -43,12 +43,29 @@ func TestEndpoint(t *testing.T) {
 				t.Errorf("path = %q, want %q", u.Path, tc.wantPath)
 			}
 			q := u.Query()
-			if q.Get("api_key") != "secret-key" {
-				t.Errorf("api_key = %q, want %q", q.Get("api_key"), "secret-key")
+			if q.Get("api_key") != "" {
+				t.Errorf("endpoint leaked api_key = %q", q.Get("api_key"))
 			}
 			if q.Get("gpu_id") != tc.gpuID {
 				t.Errorf("gpu_id = %q, want %q", q.Get("gpu_id"), tc.gpuID)
 			}
 		})
+	}
+}
+
+func TestEndpointRejectsRemotePlaintext(t *testing.T) {
+	c := &Client{cfg: &types.Config{PoolURL: "http://pool.example.com"}, gpuID: "gpu"}
+	if _, err := c.endpoint(); err == nil {
+		t.Fatal("expected remote plaintext WebSocket URL to be rejected")
+	}
+}
+
+func TestDeterministicGPUID(t *testing.T) {
+	first := deterministicGPUID("49c6e0e1-75c7-4fa2-a5cb-bb55ebcec900", 0)
+	if first != deterministicGPUID("49c6e0e1-75c7-4fa2-a5cb-bb55ebcec900", 0) {
+		t.Fatal("same machine and device must produce a stable GPU ID")
+	}
+	if first == deterministicGPUID("49c6e0e1-75c7-4fa2-a5cb-bb55ebcec900", 1) {
+		t.Fatal("different devices must produce different GPU IDs")
 	}
 }

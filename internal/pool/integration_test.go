@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // TestRegisterHandshake stands up a local raw-WebSocket server that mimics
 // pool-api's /agent endpoint and verifies the Go client connects with the
-// right auth query params and emits a well-formed gpu_register frame.
+// right bearer credential and emits a well-formed gpu_register frame.
 func TestRegisterHandshake(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	received := make(chan map[string]interface{}, 1)
@@ -23,8 +23,8 @@ func TestRegisterHandshake(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/agent", func(w http.ResponseWriter, r *http.Request) {
 		authParams <- map[string]string{
-			"api_key": r.URL.Query().Get("api_key"),
-			"gpu_id":  r.URL.Query().Get("gpu_id"),
+			"authorization": r.Header.Get("Authorization"),
+			"gpu_id":        r.URL.Query().Get("gpu_id"),
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -68,11 +68,11 @@ func TestRegisterHandshake(t *testing.T) {
 	defer cancel()
 	go func() { _ = client.Run(ctx) }()
 
-	// Verify auth query params.
+	// Verify bearer auth and non-secret GPU query parameter.
 	select {
 	case ap := <-authParams:
-		if ap["api_key"] != "test-key" {
-			t.Errorf("api_key = %q, want test-key", ap["api_key"])
+		if ap["authorization"] != "Bearer test-key" {
+			t.Errorf("authorization = %q, want Bearer test-key", ap["authorization"])
 		}
 		if ap["gpu_id"] != "gpu-test" {
 			t.Errorf("gpu_id = %q, want gpu-test", ap["gpu_id"])

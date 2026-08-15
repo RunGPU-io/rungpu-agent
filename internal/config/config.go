@@ -3,12 +3,15 @@
 package config
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/RunGPU-io/gpu-agent/internal/gpu"
-	"github.com/RunGPU-io/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -24,11 +27,9 @@ func DefaultConfigPath() string {
 
 // New builds a default config, auto-detecting local GPUs.
 func New(apiKey string) (*types.Config, error) {
-	gpus := gpu.Detect()
-
-	gpuIDs := make([]string, 0, len(gpus))
-	for _, g := range gpus {
-		gpuIDs = append(gpuIDs, fmt.Sprintf("gpu-%d", g.Index))
+	machineID, err := randomUUID()
+	if err != nil {
+		return nil, fmt.Errorf("create machine identity: %w", err)
 	}
 
 	home, err := os.UserHomeDir()
@@ -36,34 +37,77 @@ func New(apiKey string) (*types.Config, error) {
 		home = "."
 	}
 
-	return &types.Config{
+	cfg := &types.Config{
 		APIKey:                apiKey,
+		MachineID:             machineID,
 		PoolURL:               "https://pool.rungpu.io",
-		GPUIDs:                gpuIDs,
 		PricePerMinute:        0.02,
 		ModelCacheDir:         filepath.Join(home, ".tokenize", "models"),
 		MaxModelCacheGB:       100,
 		CleanupIntervalHours:  24,
+		CustomAssetTTLDays:    7,
+		MaxCustomAssetCacheGB: 20,
 		HeartbeatIntervalSecs: 30,
 		Metrics: types.MetricsConfig{
 			EnableGPUMonitoring:    true,
 			MonitoringIntervalSecs: 5,
 		},
-	}, nil
+	}
+	RefreshGPUIDs(cfg)
+	ApplyDefaults(cfg)
+	return cfg, nil
+}
+
+func randomUUID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return formatUUID(b), nil
+}
+
+func formatUUID(b []byte) string {
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func deterministicGPUID(machineID string, deviceIndex int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", machineID, deviceIndex)))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x50
+	b[8] = (b[8] & 0x3f) | 0x80
+	return formatUUID(b)
+}
+
+func RefreshGPUIDs(cfg *types.Config) {
+	detected := gpu.Detect()
+	count := len(detected)
+	if count == 0 {
+		count = 1
+	}
+	cfg.GPUIDs = make([]string, 0, count)
+	for position := 0; position < count; position++ {
+		deviceIndex := position
+		if position < len(detected) {
+			deviceIndex = detected[position].Index
+		}
+		cfg.GPUIDs = append(cfg.GPUIDs, deterministicGPUID(cfg.MachineID, deviceIndex))
+	}
 }
 
 // Load reads and parses a config file. Warns if the file has insecure
-// permissions (the config contains the API key).
+// permissions (the config contains a machine-scoped credential).
 func Load(path string) (*types.Config, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("config file not found at %s: %w", path, err)
 	}
 
-	// Check permissions on Unix — warn if group/other can read (API key exposure)
+	// Check permissions on Unix — warn if group/other can read the credential.
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		fmt.Fprintf(os.Stderr,
-			"WARNING: config file %s has permissions %o — should be 600 (contains API key).\n"+
+			"WARNING: config file %s has permissions %o — should be 600 (contains a machine credential).\n"+
 				"  Fix with: chmod 600 %s\n", path, mode, path)
 	}
 
@@ -80,7 +124,7 @@ func Load(path string) (*types.Config, error) {
 
 // Save writes the config to disk with helpful comments, creating parent
 // directories as needed. The file is written with 0600 permissions since it
-// contains the API key.
+// contains the machine credential.
 func Save(cfg *types.Config, path string) error {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -108,9 +152,13 @@ func generateCommentedConfig(cfg *types.Config) string {
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Authentication ─────────────────────────────────────────────────────────
-# Your API key from the RunGPU dashboard. Keep this secret.
-# Get a new key: https://www.rungpu.io/marketplace/host
+# Revocable credential for this enrolled machine. Never use an owner account
+# key here. Override at runtime with RUNGPU_AGENT_KEY when managed externally.
 api_key: %q
+
+# Stable identity for this physical computer. Generated once; do not copy this
+# config to another computer.
+machine_id: %q
 
 # ── Pool Connection ────────────────────────────────────────────────────────
 # The RunGPU pool coordinator URL. The agent connects outbound over WebSocket.
@@ -128,8 +176,7 @@ gpu_ids:%s
 # Passed as: docker run --gpus device=<gpu_device>
 gpu_device: %q
 
-# Your price per GPU-minute in USD. You earn 85%% of this; 15%% is the
-# platform fee. Set competitively — check marketplace for current rates.
+# Your listing price per GPU-minute in USD.
 price_per_minute: %.4f
 
 # ── Model Cache ────────────────────────────────────────────────────────────
@@ -141,13 +188,26 @@ model_cache_dir: %q
 # automatically when this limit is reached (LRU eviction).
 max_model_cache_gb: %d
 
-# How often to run cache cleanup (hours). Set to 0 to disable.
+# How often to run cache cleanup (hours). Default: 24. Set to -1 to disable.
 cleanup_interval_hours: %d
+
+# Remove cached LoRAs, checkpoints, workflows, and stale job staging after this
+# many days without use. Default: 7. Set to -1 to disable age-based removal.
+custom_asset_ttl_days: %d
+
+# Maximum combined size of cached LoRAs, checkpoints, and workflows (GB).
+# When exceeded, least-recently-used assets are removed first. Set to -1 to
+# disable the size budget while retaining TTL cleanup.
+max_custom_asset_cache_gb: %d
 
 # ── Agent Behavior ─────────────────────────────────────────────────────────
 # How often to send heartbeats to the pool (seconds). The pool marks your
 # GPU as offline if no heartbeat is received for 90 seconds.
 heartbeat_interval_secs: %d
+
+# Allow this machine to serve pool jobs without a detected GPU accelerator.
+# Default: false. Enable only when CPU-backed Ollama inference is intentional.
+allow_cpu_serving: %t
 
 # Maximum runtime for a batch job (minutes) before the container is killed.
 # 0 = default (60 minutes). Workspace jobs (ComfyUI, Jupyter) are not affected.
@@ -173,9 +233,7 @@ security:
   # Only enable if you trust all renters. Default: false.
   allow_any_image: %t
 
-  # Additional trusted Docker registries beyond the built-in list.
-  # Built-in: ghcr.io/tokenize/, ghcr.io/ai-dock/, registry.hf.space/,
-  #           docker.io/library/, jupyter/, pytorch/, nvcr.io/nvidia/
+  # Additional Docker registries this host explicitly trusts.
   # Example: ["myregistry.com/", "ghcr.io/my-org/"]
   trusted_registries: []
 
@@ -191,12 +249,11 @@ security:
   # Default: false (containers are network-isolated on Docker bridge).
   allow_host_network: %t
 
-  # HuggingFace access token for downloading gated models (e.g. Llama 3).
-  # Get yours at: https://huggingface.co/settings/tokens
-  # Leave empty if you don't need gated model access.
-  hf_token: %q
+# For gated models, provide HF_TOKEN in the agent process environment.
+# Tokens are intentionally never stored in this file.
 `,
 		cfg.APIKey,
+		cfg.MachineID,
 		cfg.PoolURL,
 		gpuIDs,
 		cfg.GPUDevice,
@@ -204,7 +261,10 @@ security:
 		cfg.ModelCacheDir,
 		cfg.MaxModelCacheGB,
 		cfg.CleanupIntervalHours,
+		cfg.CustomAssetTTLDays,
+		cfg.MaxCustomAssetCacheGB,
 		cfg.HeartbeatIntervalSecs,
+		cfg.AllowCPUServing,
 		cfg.JobTimeoutMinutes,
 		cfg.MaxCustomFileGB,
 		cfg.Metrics.EnableGPUMonitoring,
@@ -213,21 +273,29 @@ security:
 		cfg.Security.MaxMemoryGB,
 		cfg.Security.MaxCPUs,
 		cfg.Security.AllowHostNetwork,
-		cfg.Security.HFToken,
 	)
 }
 
 // ApplyDefaults fills in any missing fields with sensible defaults so a
 // minimal config (just api_key) is enough to start the agent.
 func ApplyDefaults(cfg *types.Config) {
+	if key := strings.TrimSpace(os.Getenv("RUNGPU_AGENT_KEY")); key != "" {
+		cfg.APIKey = key
+	}
+	if token := strings.TrimSpace(os.Getenv("HF_TOKEN")); token != "" {
+		cfg.Security.HFToken = token
+	}
+	if cfg.MachineID == "" {
+		machineID, err := randomUUID()
+		if err == nil {
+			cfg.MachineID = machineID
+		}
+	}
 	if cfg.PoolURL == "" {
 		cfg.PoolURL = "https://pool.rungpu.io"
 	}
 	if len(cfg.GPUIDs) == 0 {
-		gpus := gpu.Detect()
-		for _, g := range gpus {
-			cfg.GPUIDs = append(cfg.GPUIDs, fmt.Sprintf("gpu-%d", g.Index))
-		}
+		RefreshGPUIDs(cfg)
 	}
 	if cfg.PricePerMinute == 0 {
 		cfg.PricePerMinute = 0.02
@@ -245,8 +313,33 @@ func ApplyDefaults(cfg *types.Config) {
 	if cfg.CleanupIntervalHours == 0 {
 		cfg.CleanupIntervalHours = 24
 	}
+	if cfg.CustomAssetTTLDays == 0 {
+		cfg.CustomAssetTTLDays = 7
+	}
+	if cfg.MaxCustomAssetCacheGB == 0 {
+		cfg.MaxCustomAssetCacheGB = 20
+	}
 	if cfg.HeartbeatIntervalSecs == 0 {
 		cfg.HeartbeatIntervalSecs = 30
+	}
+	if cfg.JobTimeoutMinutes <= 0 {
+		cfg.JobTimeoutMinutes = 60
+	}
+	if cfg.MaxCustomFileGB <= 0 {
+		cfg.MaxCustomFileGB = 20
+	}
+	system := gpu.DetectSystem()
+	if cfg.Security.MaxMemoryGB <= 0 {
+		cfg.Security.MaxMemoryGB = int(system.RAMTotalGB * 0.8)
+		if cfg.Security.MaxMemoryGB < 4 {
+			cfg.Security.MaxMemoryGB = 4
+		}
+	}
+	if cfg.Security.MaxCPUs <= 0 {
+		cfg.Security.MaxCPUs = float64(system.CPUCores) / 2
+		if cfg.Security.MaxCPUs < 1 {
+			cfg.Security.MaxCPUs = 1
+		}
 	}
 	if !cfg.Metrics.EnableGPUMonitoring && cfg.Metrics.MonitoringIntervalSecs == 0 {
 		cfg.Metrics.EnableGPUMonitoring = true
@@ -257,7 +350,7 @@ func ApplyDefaults(cfg *types.Config) {
 // Validate checks required fields.
 func Validate(cfg *types.Config) error {
 	if cfg.APIKey == "" {
-		return fmt.Errorf("api_key is empty — set it in %s or run: rungpu-agent init --api-key YOUR_KEY", DefaultConfigPath())
+		return fmt.Errorf("machine credential is empty — enroll this host or set RUNGPU_AGENT_KEY")
 	}
 	// Auto-fill everything else so a minimal config works.
 	ApplyDefaults(cfg)

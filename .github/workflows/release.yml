@@ -115,14 +115,14 @@ jobs:
             tar xzf rungpu-agent-darwin-arm64.tar.gz
             chmod +x rungpu-agent-darwin-arm64
 
-            # Initialize with your API key
-            ./rungpu-agent-darwin-arm64 init --api-key YOUR_API_KEY
+            # Enroll with this machine's one-time token
+            ./rungpu-agent-darwin-arm64 init --enrollment-token YOUR_ONE_TIME_TOKEN
 
             # Start earning
             ./rungpu-agent-darwin-arm64 start
             ```
 
-            Get your API key at [rungpu.io/marketplace/host](https://www.rungpu.io/marketplace/host)
+            Create an enrollment token at [rungpu.io/marketplace/host](https://www.rungpu.io/marketplace/host)
 
             ### Verify Download
 
@@ -130,7 +130,7 @@ jobs:
             sha256sum -c checksums.txt
             ```
 
-            See [README](https://github.com/RunGPU-io/gpu-agent#readme) for full documentation.
+            See [README](https://github.com/RunGPU-io/rungpu-agent#readme) for full documentation.
           files: release/*
           draft: false
           prerelease: false
