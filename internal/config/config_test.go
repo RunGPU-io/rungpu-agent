@@ -72,6 +72,14 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestApplyDefaultsPreservesFreeContribution(t *testing.T) {
+	cfg := &types.Config{PricePerMinute: 0, ContributeFree: true}
+	ApplyDefaults(cfg)
+	if cfg.PricePerMinute != 0 {
+		t.Fatalf("PricePerMinute = %v, want 0 for free contribution", cfg.PricePerMinute)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Error("expected error loading missing file")

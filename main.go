@@ -209,6 +209,7 @@ func cmdInit(args []string) error {
 	cfg.PoolURL = *poolURL
 	cfg.MachineID = enrolled.MachineID
 	cfg.PricePerMinute = enrolled.PricePerMinute
+	cfg.ContributeFree = enrolled.PricePerMinute == 0
 	config.RefreshGPUIDs(cfg)
 	if err := config.Save(cfg, *cfgPath); err != nil {
 		return err

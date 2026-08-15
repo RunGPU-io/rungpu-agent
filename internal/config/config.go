@@ -297,7 +297,7 @@ func ApplyDefaults(cfg *types.Config) {
 	if len(cfg.GPUIDs) == 0 {
 		RefreshGPUIDs(cfg)
 	}
-	if cfg.PricePerMinute == 0 {
+	if cfg.PricePerMinute == 0 && !cfg.ContributeFree {
 		cfg.PricePerMinute = 0.02
 	}
 	if cfg.ModelCacheDir == "" {

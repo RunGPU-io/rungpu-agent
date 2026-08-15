@@ -3,6 +3,11 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [Unreleased]
+
+- Added optional public GPU contribution at no charge. Hosts can contribute
+	without payout setup, or choose paid hosting after completing Stripe setup.
+
 ## [1.1.0] - 2026-08-14
 
 - Simplified setup for individual hosts and larger GPU fleets.

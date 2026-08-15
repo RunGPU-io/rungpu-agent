@@ -24,6 +24,7 @@ type Config struct {
 	PoolURL               string   `yaml:"pool_url"`
 	GPUIDs                []string `yaml:"gpu_ids"`
 	PricePerMinute        float64  `yaml:"price_per_minute"`
+	ContributeFree        bool     `yaml:"contribute_free,omitempty"`
 	ModelCacheDir         string   `yaml:"model_cache_dir"`
 	MaxModelCacheGB       int      `yaml:"max_model_cache_gb"`
 	CleanupIntervalHours  int      `yaml:"cleanup_interval_hours"`
