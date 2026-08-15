@@ -52,6 +52,15 @@ if [[ "$rungpu_contacts" != "support@rungpu.io" ]]; then
     fail=1
 fi
 
+module_path=$(awk '$1 == "module" { print $2; exit }' go.mod)
+if [[ "$module_path" == "github.com/RunGPU-io/rungpu-agent" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    commit_emails=$(git log -1 --format='%ae%n%ce' | sort -u)
+    if [[ "$commit_emails" != "support@rungpu.io" ]]; then
+        echo "ERROR: public commit metadata must use support@rungpu.io exclusively"
+        fail=1
+    fi
+fi
+
 if git grep --no-index -nE 'json:"(cpu_model|cpu_cores|os_info|ram_used_gb|cpu_percent|hostname)' -- '*.go' >/tmp/rungpu-public-audit.$$ 2>/dev/null; then
     echo "ERROR: unnecessary host fingerprint telemetry is present:"
     cat /tmp/rungpu-public-audit.$$
