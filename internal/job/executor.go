@@ -2,6 +2,7 @@ package job
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -171,7 +172,10 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 				out["upload_error"] = uploadErr.Error()
 			} else {
 				out["uploaded"] = true
-				out["upload_url"] = a.UploadURL
+				if info, statErr := os.Stat(outputPath); statErr == nil {
+					out["output_size_bytes"] = info.Size()
+					out["output_content_type"] = outputContentType(outputPath)
+				}
 			}
 		}
 	}

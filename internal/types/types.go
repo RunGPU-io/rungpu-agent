@@ -169,16 +169,17 @@ type JobProgress struct {
 // RegisterMessage announces a GPU to the pool. api_key is injected server-side
 // from the authenticated connection, so it is not sent here.
 type RegisterMessage struct {
-	Type           string   `json:"type"` // "gpu_register"
-	GPUID          string   `json:"gpu_id"`
-	MachineID      string   `json:"machine_id,omitempty"`
-	DeviceIndex    int      `json:"device_index"`
-	GPUType        string   `json:"gpu_type"`
-	Backend        string   `json:"backend"` // "cuda" | "metal" | "cpu"
-	VRAMGB         float64  `json:"vram_gb"`
-	PricePerMinute float64  `json:"price_per_minute"`
-	ModelsCached   []string `json:"models_cached"`
-	DriverVersion  string   `json:"driver_version"`
+	Type                string   `json:"type"` // "gpu_register"
+	GPUID               string   `json:"gpu_id"`
+	MachineID           string   `json:"machine_id,omitempty"`
+	DeviceIndex         int      `json:"device_index"`
+	DetectedDeviceCount int      `json:"detected_device_count"`
+	GPUType             string   `json:"gpu_type"`
+	Backend             string   `json:"backend"` // "cuda" | "metal" | "cpu"
+	VRAMGB              float64  `json:"vram_gb"`
+	PricePerMinute      float64  `json:"price_per_minute"`
+	ModelsCached        []string `json:"models_cached"`
+	DriverVersion       string   `json:"driver_version"`
 
 	// ── Runtime capabilities (what job types this host can serve) ────────
 	Capabilities []string `json:"capabilities,omitempty"`  // ["ollama","docker","workspace"]

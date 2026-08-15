@@ -555,18 +555,19 @@ func (c *Client) registerMessage() types.RegisterMessage {
 		break
 	}
 	return types.RegisterMessage{
-		Type:           "gpu_register",
-		GPUID:          c.gpuID,
-		MachineID:      c.cfg.MachineID,
-		DeviceIndex:    c.deviceIndex,
-		GPUType:        name,
-		Backend:        c.backend,
-		VRAMGB:         vramGB,
-		PricePerMinute: c.cfg.PricePerMinute,
-		ModelsCached:   c.cachedModels(),
-		DriverVersion:  driver,
-		Capabilities:   gpu.RuntimeCapabilities(),
-		OllamaModels:   gpu.OllamaModels(),
+		Type:                "gpu_register",
+		GPUID:               c.gpuID,
+		MachineID:           c.cfg.MachineID,
+		DeviceIndex:         c.deviceIndex,
+		DetectedDeviceCount: len(gpus),
+		GPUType:             name,
+		Backend:             c.backend,
+		VRAMGB:              vramGB,
+		PricePerMinute:      c.cfg.PricePerMinute,
+		ModelsCached:        c.cachedModels(),
+		DriverVersion:       driver,
+		Capabilities:        gpu.RuntimeCapabilities(),
+		OllamaModels:        gpu.OllamaModels(),
 	}
 }
 

@@ -202,7 +202,7 @@ func TestRegisterMessageFormat(t *testing.T) {
 	data, _ := json.Marshal(msg)
 	var raw map[string]interface{}
 	json.Unmarshal(data, &raw)
-	for _, k := range []string{"type", "gpu_id", "gpu_type", "backend", "vram_gb", "price_per_minute"} {
+	for _, k := range []string{"type", "gpu_id", "gpu_type", "backend", "vram_gb", "price_per_minute", "detected_device_count"} {
 		if _, ok := raw[k]; !ok {
 			t.Errorf("missing field %q", k)
 		}

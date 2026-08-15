@@ -454,21 +454,7 @@ func UploadOutput(ctx context.Context, filePath, uploadURL string) error {
 	}
 	req.ContentLength = info.Size()
 
-	// Detect content type from extension
-	switch strings.ToLower(filepath.Ext(filePath)) {
-	case ".mp4":
-		req.Header.Set("Content-Type", "video/mp4")
-	case ".webm":
-		req.Header.Set("Content-Type", "video/webm")
-	case ".png":
-		req.Header.Set("Content-Type", "image/png")
-	case ".jpg", ".jpeg":
-		req.Header.Set("Content-Type", "image/jpeg")
-	case ".webp":
-		req.Header.Set("Content-Type", "image/webp")
-	default:
-		req.Header.Set("Content-Type", "application/octet-stream")
-	}
+	req.Header.Set("Content-Type", outputContentType(filePath))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -479,6 +465,23 @@ func UploadOutput(ctx context.Context, filePath, uploadURL string) error {
 		return fmt.Errorf("upload returned HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func outputContentType(filePath string) string {
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // BuildMounts creates the Docker volume mount arguments from the staging dir.
