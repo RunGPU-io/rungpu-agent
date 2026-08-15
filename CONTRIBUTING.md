@@ -12,4 +12,4 @@ We won't accept changes that weaken security or bypass platform billing.
 
 By submitting a PR, you agree your contribution is licensed under the same [Source Available license](LICENSE).
 
-Report security issues privately to security@rungpu.io.
+Report security issues privately to support@rungpu.io.

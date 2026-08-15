@@ -19,10 +19,8 @@ report_matches() {
 }
 
 forbidden_files=$(
-    git ls-files --cached --others --exclude-standard | grep -E '(^|/)(\.env($|\.)|coverage\.out$|config\.ya?ml$|.*\.(pem|key|p12|pfx)$|outbox/|dist/)' |
-    while IFS= read -r file; do
-        [[ -e "$file" ]] && echo "$file"
-    done
+    find . -type f -print | sed 's#^\./##' |
+    grep -E '(^|/)(\.env($|\.)|coverage\.out$|config\.ya?ml$|.*\.(pem|key|p12|pfx)$|outbox/|dist/)' || true
     true
 )
 if [[ -n "$forbidden_files" ]]; then
@@ -32,12 +30,27 @@ if [[ -n "$forbidden_files" ]]; then
 fi
 
 report_matches "a live credential-shaped value is present" \
-    '(sk_live_[A-Za-z0-9]{16,}|sk_test_[A-Za-z0-9]{16,}|pk_live_[A-Za-z0-9]{16,}|sbp_[A-Za-z0-9_-]{16,}|hf_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|postgres(ql)?://[^[:space:]/]+:[^[:space:]@]+@)' \
+    '(sk_live_[A-Za-z0-9]{16,}|sk_test_[A-Za-z0-9]{16,}|pk_live_[A-Za-z0-9]{16,}|sbp_[A-Za-z0-9_-]{16,}|hf_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|postgres(ql)?://[^[:space:]/]+:[^[:space:]@]+@|https://[^/[:space:]]+:[^/[:space:]]+@)' \
     .
+
+report_matches "a local absolute path is present" \
+    '/Users/[^/[:space:]]+/' \
+    . ':(exclude)scripts/audit-public.sh'
 
 report_matches "coordinator-only policy leaked into public agent source" \
     '(PLATFORM_FEE_PERCENT|TARGET_MARGIN|gpu_owner_share|settlement|stripe_transfer|payout_status|load-balancer|queue-dispatcher)' \
     '*.go' '*.sh' '*.ps1' ':(exclude)scripts/audit-public.sh'
+
+report_matches "private coordinator configuration leaked into public agent source" \
+    '(POOL_API_SECRET|JWT_SECRET|DATABASE_URL|REDIS_URL|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_ACCESS_TOKEN|rungpu-504008|420004393585|gjwmnwdlbsgyucnjgqck|\.run\.app)' \
+    . ':(exclude)scripts/audit-public.sh'
+
+rungpu_contacts=$(git grep --no-index -hEo '[A-Za-z0-9._%+-]+@rungpu\.io' -- . 2>/dev/null | sort -u || true)
+if [[ "$rungpu_contacts" != "support@rungpu.io" ]]; then
+    echo "ERROR: public contact addresses must use support@rungpu.io exclusively"
+    echo "$rungpu_contacts"
+    fail=1
+fi
 
 if git grep --no-index -nE 'json:"(cpu_model|cpu_cores|os_info|ram_used_gb|cpu_percent|hostname)' -- '*.go' >/tmp/rungpu-public-audit.$$ 2>/dev/null; then
     echo "ERROR: unnecessary host fingerprint telemetry is present:"
