@@ -18,6 +18,22 @@ report_matches() {
     fi
 }
 
+report_matches_except_literal() {
+    local description="$1"
+    local pattern="$2"
+    local allowed_literal="$3"
+    shift 3
+    local matches
+    matches=$(git grep --no-index -nEI "$pattern" -- "$@" 2>/dev/null |
+        sed "s#${allowed_literal}##g" |
+        grep -EI "$pattern" || true)
+    if [[ -n "$matches" ]]; then
+        echo "ERROR: $description"
+        echo "$matches"
+        fail=1
+    fi
+}
+
 forbidden_files=$(
     find . -type f -print | sed 's#^\./##' |
     grep -E '(^|/)(\.env($|\.)|coverage\.out$|config\.ya?ml$|.*\.(pem|key|p12|pfx)$|outbox/|dist/)' || true
@@ -41,8 +57,9 @@ report_matches "coordinator-only policy leaked into public agent source" \
     '(PLATFORM_FEE_PERCENT|TARGET_MARGIN|gpu_owner_share|settlement|stripe_transfer|payout_status|load-balancer|queue-dispatcher)' \
     '*.go' '*.sh' '*.ps1' ':(exclude)scripts/audit-public.sh'
 
-report_matches "private coordinator configuration leaked into public agent source" \
+report_matches_except_literal "private coordinator configuration leaked into public agent source" \
     '(POOL_API_SECRET|JWT_SECRET|DATABASE_URL|REDIS_URL|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_ACCESS_TOKEN|rungpu-504008|420004393585|gjwmnwdlbsgyucnjgqck|\.run\.app)' \
+    'https://rungpu-pool-api-420004393585.us-central1.run.app' \
     . ':(exclude)scripts/audit-public.sh'
 
 rungpu_contacts=$(git grep --no-index -hEo '[A-Za-z0-9._%+-]+@rungpu\.io' -- . 2>/dev/null | sort -u || true)

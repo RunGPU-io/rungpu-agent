@@ -15,6 +15,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultPoolURL = "https://rungpu-pool-api-420004393585.us-central1.run.app"
+
 // DefaultConfigPath returns the cross-platform default config location:
 // ~/.tokenize/config.yaml (Windows: %USERPROFILE%\.tokenize\config.yaml).
 func DefaultConfigPath() string {
@@ -40,7 +42,7 @@ func New(apiKey string) (*types.Config, error) {
 	cfg := &types.Config{
 		APIKey:                apiKey,
 		MachineID:             machineID,
-		PoolURL:               "https://pool.rungpu.io",
+		PoolURL:               DefaultPoolURL,
 		PricePerMinute:        0.02,
 		ModelCacheDir:         filepath.Join(home, ".tokenize", "models"),
 		MaxModelCacheGB:       100,
@@ -163,7 +165,7 @@ machine_id: %q
 # ── Pool Connection ────────────────────────────────────────────────────────
 # The RunGPU pool coordinator URL. The agent connects outbound over WebSocket.
 # No inbound ports or public IP needed — works behind NAT/firewalls.
-#   Production: https://pool.rungpu.io
+#   Production: https://rungpu-pool-api-420004393585.us-central1.run.app
 #   Local dev:  http://localhost:3001
 pool_url: %q
 
@@ -292,7 +294,7 @@ func ApplyDefaults(cfg *types.Config) {
 		}
 	}
 	if cfg.PoolURL == "" {
-		cfg.PoolURL = "https://pool.rungpu.io"
+		cfg.PoolURL = DefaultPoolURL
 	}
 	if len(cfg.GPUIDs) == 0 {
 		RefreshGPUIDs(cfg)

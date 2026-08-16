@@ -88,7 +88,7 @@ Run "tokenize-gpu-agent <command> -h" for command flags.`)
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	enrollmentToken := fs.String("enrollment-token", "", "one-time fleet enrollment token")
-	poolURL := fs.String("pool-url", "https://pool.rungpu.io", "pool coordinator URL")
+	poolURL := fs.String("pool-url", config.DefaultPoolURL, "pool coordinator URL")
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 
