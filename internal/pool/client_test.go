@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 func TestEndpoint(t *testing.T) {

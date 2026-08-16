@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 func TestResolveImage(t *testing.T) {

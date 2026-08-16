@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 const runtimeSmokeModel = "qwen2.5:0.5b"

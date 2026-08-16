@@ -8,6 +8,14 @@ security details are intentionally excluded.
 - Added optional public GPU contribution at no charge. Hosts can contribute
 	without payout setup, or choose paid hosting after completing Stripe setup.
 
+## [1.2.0] - 2026-08-16
+
+- Added an explicit `setup` command for installing supported runtime
+	requirements before starting the agent.
+- Improved enrollment recovery by saving credentials before runtime checks and
+	printing the exact next commands.
+- Added runtime capability reporting so incomplete hosts are not marked ready.
+
 ## [1.1.0] - 2026-08-14
 
 - Simplified setup for individual hosts and larger GPU fleets.

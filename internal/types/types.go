@@ -182,7 +182,7 @@ type RegisterMessage struct {
 	DriverVersion       string   `json:"driver_version"`
 
 	// ── Runtime capabilities (what job types this host can serve) ────────
-	Capabilities []string `json:"capabilities,omitempty"`  // ["ollama","docker","workspace"]
+	Capabilities []string `json:"capabilities"`            // ["ollama","docker","workspace"]
 	OllamaModels []string `json:"ollama_models,omitempty"` // models pulled in Ollama (not just cache dir)
 }
 

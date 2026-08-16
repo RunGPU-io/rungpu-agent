@@ -29,10 +29,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/config"
-	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
-	"github.com/RunGPU-io/rungpu-agent/internal/pool"
+	"github.com/tokenize/gpu-agent/internal/config"
+	"github.com/tokenize/gpu-agent/internal/dockermgr"
+	"github.com/tokenize/gpu-agent/internal/gpu"
+	"github.com/tokenize/gpu-agent/internal/pool"
 )
 
 func main() {
@@ -48,6 +48,8 @@ func main() {
 	switch cmd {
 	case "init":
 		err = cmdInit(args)
+	case "setup":
+		err = cmdSetup(args)
 	case "start":
 		err = cmdStart(args)
 	case "status":
@@ -70,10 +72,11 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`rungpu-agent — RunGPU GPU pool agent
+	fmt.Println(`tokenize-gpu-agent — Tokenize GPU pool agent
 
 Commands:
   init     Create config (auto-detects GPUs)
+	setup    Install runtime requirements with the platform package manager
   start    Connect to the pool and serve jobs
   status   Show detected GPUs and live metrics
   cleanup  Remove containers, volumes, images, caches, config, and services
@@ -99,6 +102,31 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	cfg, err := config.New(enrolled.AgentKey)
+	if err != nil {
+		return err
+	}
+	cfg.PoolURL = *poolURL
+	cfg.MachineID = enrolled.MachineID
+	cfg.PricePerMinute = enrolled.PricePerMinute
+	cfg.ContributeFree = enrolled.PricePerMinute == 0
+	config.RefreshGPUIDs(cfg)
+	if err := config.Save(cfg, *cfgPath); err != nil {
+		return err
+	}
+
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		executable = "rungpu-agent"
+	}
+	start := startCommand(runtime.GOOS, filepath.Base(executable))
+	setup := setupCommand(runtime.GOOS, filepath.Base(executable))
+	fmt.Println()
+	fmt.Println("Enrollment successful. This machine is connected to RunGPU.")
+	fmt.Printf("Credentials saved to: %s\n", *cfgPath)
+	fmt.Println("Start the agent now with:")
+	fmt.Printf("  %s\n", start)
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
@@ -178,7 +206,9 @@ func cmdInit(args []string) error {
 
 	if issues > 0 {
 		fmt.Printf("  ⚠️  %d issue(s) found. The agent may not work correctly.\n", issues)
-		fmt.Println("     Fix the issues above, then re-run init.")
+		fmt.Println("     Enrollment is saved. Do not run init again.")
+		fmt.Printf("     Install requirements: %s\n", setup)
+		fmt.Printf("     Then start the agent: %s\n", start)
 		fmt.Println()
 	}
 
@@ -201,19 +231,6 @@ func cmdInit(args []string) error {
 	// ── Step 3: Create config ───────────────────────────────────────────
 	fmt.Println("Step 3/4 — Creating configuration...")
 	fmt.Println()
-
-	cfg, err := config.New(enrolled.AgentKey)
-	if err != nil {
-		return err
-	}
-	cfg.PoolURL = *poolURL
-	cfg.MachineID = enrolled.MachineID
-	cfg.PricePerMinute = enrolled.PricePerMinute
-	cfg.ContributeFree = enrolled.PricePerMinute == 0
-	config.RefreshGPUIDs(cfg)
-	if err := config.Save(cfg, *cfgPath); err != nil {
-		return err
-	}
 	fmt.Printf("  ✅ Config saved to: %s\n", *cfgPath)
 	fmt.Printf("  ✅ Pool URL: %s\n", cfg.PoolURL)
 	fmt.Printf("  ✅ Machine ID: %s\n", cfg.MachineID)
@@ -225,7 +242,7 @@ func cmdInit(args []string) error {
 	fmt.Println("  ┌─────────────────────────────────────────────────────┐")
 	fmt.Println("  │  Your GPU agent is configured. Start it with:      │")
 	fmt.Println("  │                                                     │")
-	fmt.Println("  │    rungpu-agent start                               │")
+	fmt.Printf("  │    %-48s │\n", start)
 	fmt.Println("  │                                                     │")
 	fmt.Println("  │  The agent will connect to the pool, register your  │")
 	fmt.Println("  │  GPU, and start accepting jobs automatically.       │")
@@ -239,6 +256,88 @@ func cmdInit(args []string) error {
 	fmt.Println()
 
 	return nil
+}
+
+func startCommand(goos, executable string) string {
+	if goos == "windows" {
+		return `.\` + executable + " start"
+	}
+	return "./" + executable + " start"
+}
+
+func setupCommand(goos, executable string) string {
+	if goos == "windows" {
+		return `.\` + executable + " setup"
+	}
+	return "./" + executable + " setup"
+}
+
+func cmdSetup(args []string) error {
+	fs := flag.NewFlagSet("setup", flag.ExitOnError)
+	_ = fs.Parse(args)
+
+	commands, err := setupCommands(runtime.GOOS)
+	if err != nil {
+		return err
+	}
+	for _, command := range commands {
+		fmt.Printf("Running: %s\n", strings.Join(command, " "))
+		cmd := exec.Command(command[0], command[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("install runtime requirement: %w", err)
+		}
+	}
+
+	fmt.Println("Runtime installation finished.")
+	if runtime.GOOS == "windows" {
+		fmt.Println("Open Docker Desktop and finish its WSL2 setup, then restart Windows if prompted.")
+	}
+	fmt.Println("Run the agent again with: " + startCommand(runtime.GOOS, executableName()))
+	return nil
+}
+
+func setupCommands(goos string) ([][]string, error) {
+	switch goos {
+	case "windows":
+		if _, err := exec.LookPath("winget"); err != nil {
+			return nil, fmt.Errorf("winget is required; install App Installer from the Microsoft Store")
+		}
+		return setupCommandPlan(goos), nil
+	case "darwin":
+		if _, err := exec.LookPath("brew"); err != nil {
+			return nil, fmt.Errorf("Homebrew is required; install it from https://brew.sh")
+		}
+		return setupCommandPlan(goos), nil
+	case "linux":
+		return nil, fmt.Errorf("install Docker for your distribution from https://docs.docker.com/engine/install/ and Ollama from https://ollama.com/download/linux")
+	default:
+		return nil, fmt.Errorf("automatic setup is not supported on %s", goos)
+	}
+}
+
+func setupCommandPlan(goos string) [][]string {
+	switch goos {
+	case "windows":
+		return [][]string{
+			{"winget", "install", "--id", "Docker.DockerDesktop", "--exact", "--accept-package-agreements", "--accept-source-agreements"},
+			{"winget", "install", "--id", "Ollama.Ollama", "--exact", "--accept-package-agreements", "--accept-source-agreements"},
+		}
+	case "darwin":
+		return [][]string{{"brew", "install", "ollama"}}
+	default:
+		return nil
+	}
+}
+
+func executableName() string {
+	executable, err := os.Executable()
+	if err != nil {
+		return "rungpu-agent"
+	}
+	return filepath.Base(executable)
 }
 
 type enrollmentResponse struct {
@@ -353,7 +452,7 @@ func cmdStatus(args []string) error {
 	gpus := monitor.GPUs()
 	backend := monitor.Backend()
 
-	fmt.Println("\n=== RunGPU Agent Status ===")
+	fmt.Println("\n=== Tokenize GPU Agent Status ===")
 	fmt.Printf("Backend: %s\n", backend)
 	if backend != "cuda" {
 		fmt.Println("  (non-NVIDIA host: jobs run natively via Ollama; install from https://ollama.com)")
@@ -451,12 +550,12 @@ Examples:
 	hasDocker := docker.Available(ctx)
 
 	if *dryRun && nothingSelected {
-		fmt.Println("\n=== RunGPU Agent — Cleanup Overview ===")
+		fmt.Println("\n=== Tokenize GPU Agent — Cleanup Overview ===")
 		fmt.Println("Showing what exists on this machine. Pass flags to remove.")
 	} else if *dryRun {
 		fmt.Println("\n=== Dry Run — nothing will be removed ===")
 	} else {
-		fmt.Println("\n=== RunGPU Agent — Cleanup ===")
+		fmt.Println("\n=== Tokenize GPU Agent — Cleanup ===")
 	}
 
 	totalCleaned := 0

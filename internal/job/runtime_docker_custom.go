@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/dockermgr"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 // customDockerRuntime runs jobs in a user-specified Docker image. Handles:

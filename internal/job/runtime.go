@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/dockermgr"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 // Runtime executes inference jobs for a particular accelerator backend.

@@ -15,6 +15,7 @@ List your GPU, earn money when others rent it. Source available so you can audit
 
 ```bash
 ./rungpu-agent init --enrollment-token YOUR_ONE_TIME_TOKEN
+./rungpu-agent setup
 ./rungpu-agent start
 ```
 
@@ -40,6 +41,7 @@ sudo ./scripts/install.sh
 | Command | What it does |
 |---|---|
 | `rungpu-agent init --enrollment-token TOKEN` | Enroll this machine |
+| `rungpu-agent setup` | Install supported runtime requirements |
 | `rungpu-agent start` | Start earning |
 | `rungpu-agent status` | Check GPU status |
 | `rungpu-agent cleanup` | Remove agent data |

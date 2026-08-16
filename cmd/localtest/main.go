@@ -43,9 +43,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
-	"github.com/RunGPU-io/rungpu-agent/internal/job"
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/gpu"
+	"github.com/tokenize/gpu-agent/internal/job"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 func main() {

@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/dockermgr"
+	"github.com/tokenize/gpu-agent/internal/types"
 )
 
 // Executor orchestrates a single job through the full pipeline:

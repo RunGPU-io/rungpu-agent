@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/tokenize/gpu-agent/internal/gpu"
+	"github.com/tokenize/gpu-agent/internal/types"
 	"gopkg.in/yaml.v3"
 )
 
