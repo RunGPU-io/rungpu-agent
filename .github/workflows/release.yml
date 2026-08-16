@@ -133,7 +133,7 @@ jobs:
             sha256sum -c checksums.txt
             ```
 
-            See [README](https://github.com/rungpu/gpu-agent#readme) for full documentation.
+            See [README](https://github.com/RunGPU-io/rungpu-agent#readme) for full documentation.
           files: release/*
           draft: false
           prerelease: false

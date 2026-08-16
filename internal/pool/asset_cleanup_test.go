@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestPruneCustomAssetsRequiresIdleMachine(t *testing.T) {

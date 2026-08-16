@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
-	"github.com/tokenize/gpu-agent/internal/gpu"
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -107,7 +108,7 @@ func Load(path string) (*types.Config, error) {
 	}
 
 	// Check permissions on Unix — warn if group/other can read the credential.
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+	if mode := info.Mode().Perm(); configPermissionsNeedWarning(runtime.GOOS, mode) {
 		fmt.Fprintf(os.Stderr,
 			"WARNING: config file %s has permissions %o — should be 600 (contains a machine credential).\n"+
 				"  Fix with: chmod 600 %s\n", path, mode, path)
@@ -122,6 +123,10 @@ func Load(path string) (*types.Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	return &cfg, nil
+}
+
+func configPermissionsNeedWarning(goos string, mode os.FileMode) bool {
+	return goos != "windows" && mode.Perm()&0o077 != 0
 }
 
 // Save writes the config to disk with helpful comments, creating parent

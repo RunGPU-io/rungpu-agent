@@ -29,10 +29,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tokenize/gpu-agent/internal/config"
-	"github.com/tokenize/gpu-agent/internal/dockermgr"
-	"github.com/tokenize/gpu-agent/internal/gpu"
-	"github.com/tokenize/gpu-agent/internal/pool"
+	"github.com/RunGPU-io/rungpu-agent/internal/config"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
+	"github.com/RunGPU-io/rungpu-agent/internal/pool"
 )
 
 func main() {
@@ -72,13 +72,13 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`tokenize-gpu-agent — Tokenize GPU pool agent
+	fmt.Println(`rungpu-agent — RunGPU GPU pool agent
 
 Commands:
   init     Create config (auto-detects GPUs)
 	setup    Install runtime requirements with the platform package manager
   start    Connect to the pool and serve jobs
-  status   Show detected GPUs and live metrics
+	status   Check enrollment, runtime readiness, GPUs, and live metrics
   cleanup  Remove containers, volumes, images, caches, config, and services
 
 Run "tokenize-gpu-agent <command> -h" for command flags.`)
@@ -445,17 +445,36 @@ func cmdStart(args []string) error {
 
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	_ = fs.String("config", config.DefaultConfigPath(), "config file path")
+	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 
 	monitor := gpu.NewMonitor()
 	gpus := monitor.GPUs()
 	backend := monitor.Backend()
+	capabilities := gpu.RuntimeCapabilities()
+	requiredRuntime, runtimeReady := runtimeReadiness(backend, capabilities)
 
-	fmt.Println("\n=== Tokenize GPU Agent Status ===")
+	fmt.Println("\n=== RunGPU Agent Status ===")
+	if cfg, err := config.Load(*cfgPath); err == nil && cfg.APIKey != "" && cfg.MachineID != "" {
+		fmt.Printf("Enrollment: Configured (%s)\n", cfg.MachineID)
+	} else {
+		fmt.Println("Enrollment: Not configured")
+		fmt.Println("  Run the enrollment command from the RunGPU host dashboard.")
+	}
 	fmt.Printf("Backend: %s\n", backend)
 	if backend != "cuda" {
 		fmt.Println("  (non-NVIDIA host: jobs run natively via Ollama; install from https://ollama.com)")
+	}
+	if runtimeReady {
+		fmt.Printf("Runtime: Ready (%s)\n", requiredRuntime)
+	} else {
+		fmt.Printf("Runtime: Setup required (%s is unavailable)\n", requiredRuntime)
+		fmt.Printf("  Run: %s\n", setupCommand(runtime.GOOS, executableName()))
+	}
+	if len(capabilities) > 0 {
+		fmt.Printf("Capabilities: %s\n", strings.Join(capabilities, ", "))
+	} else {
+		fmt.Println("Capabilities: none")
 	}
 	fmt.Printf("Detected GPUs: %d\n", len(gpus))
 	for _, g := range gpus {
@@ -478,6 +497,19 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("\nHealth: %s\n\n", healthy)
 	return nil
+}
+
+func runtimeReadiness(backend string, capabilities []string) (string, bool) {
+	required := "ollama"
+	if backend == "cuda" {
+		required = "docker"
+	}
+	for _, capability := range capabilities {
+		if capability == required {
+			return required, true
+		}
+	}
+	return required, false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -550,12 +582,12 @@ Examples:
 	hasDocker := docker.Available(ctx)
 
 	if *dryRun && nothingSelected {
-		fmt.Println("\n=== Tokenize GPU Agent — Cleanup Overview ===")
+		fmt.Println("\n=== RunGPU Agent — Cleanup Overview ===")
 		fmt.Println("Showing what exists on this machine. Pass flags to remove.")
 	} else if *dryRun {
 		fmt.Println("\n=== Dry Run — nothing will be removed ===")
 	} else {
-		fmt.Println("\n=== Tokenize GPU Agent — Cleanup ===")
+		fmt.Println("\n=== RunGPU Agent — Cleanup ===")
 	}
 
 	totalCleaned := 0

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokenize/gpu-agent/internal/dockermgr"
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 // workspaceRuntime runs long-lived interactive containers (ComfyUI, Jupyter,

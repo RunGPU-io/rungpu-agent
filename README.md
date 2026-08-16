@@ -54,6 +54,81 @@ sudo ./scripts/install.sh
 
 Apple Silicon Macs are supported via Ollama.
 
+## Troubleshooting
+
+### Start with `status`
+
+Run `rungpu-agent status` from the extracted agent folder. It checks whether
+the machine is enrolled, detects the GPU, lists available capabilities, and
+reports whether the required Docker or Ollama runtime is ready.
+
+If it reports `Runtime: Setup required`, use this sequence:
+
+```bash
+rungpu-agent setup
+rungpu-agent start
+rungpu-agent status
+```
+
+On macOS and Linux, use the downloaded executable name with the `./` prefix.
+Complete any installer or restart prompts before starting the agent again.
+
+### Windows: virtualization or WSL 2 not detected
+
+Docker Desktop requires hardware virtualization and WSL 2. Open **Task Manager
+> Performance > CPU** and confirm **Virtualization** is enabled. If it is
+disabled, enable Intel VT-x/VT-d or AMD-V/SVM in BIOS/UEFI.
+
+Then open PowerShell as Administrator and run:
+
+```powershell
+wsl --install
+wsl --update
+wsl --set-default-version 2
+```
+
+Restart Windows, open Docker Desktop, and verify:
+
+```powershell
+wsl --status
+docker version
+docker run --rm hello-world
+```
+
+If Windows is itself running inside a VM, the VM host must enable nested
+virtualization.
+
+### Connected, but setup is incomplete
+
+CUDA hosts require a running Docker engine. Apple Silicon hosts require Ollama.
+Run `rungpu-agent setup`, start Docker Desktop if applicable, then restart the
+agent and run `rungpu-agent status` again. A connected machine is shown in the
+marketplace only after its declared hardware matches and its required runtime
+is ready.
+
+### Security software blocks the agent
+
+Norton or another security product may flag a newly released, low-prevalence
+binary. Download only from the official RunGPU GitHub release and verify the
+published checksum. Review the source and the security product's details before
+allowing the exact verified file. Do not disable endpoint protection to install
+the agent.
+
+### Enrollment is rejected
+
+Enrollment commands are single-use and expire after seven days. Do not rerun a
+consumed command. If enrollment already succeeded, continue with `setup` and
+`start` using the saved credentials. Otherwise, generate a replacement command
+from the host dashboard.
+
+### Permission denied or command not found
+
+- Extract the downloaded archive before running the agent.
+- On macOS or Linux, run `chmod +x rungpu-agent-*` and keep the `./` prefix.
+- On Windows, run the executable from its extracted folder in PowerShell.
+- If `winget` is missing, install **App Installer** from the Microsoft Store.
+- Confirm outbound HTTPS and WebSocket traffic is allowed by the firewall.
+
 ## Asset Retention
 
 Downloaded LoRAs, checkpoints, and workflows are cached for seven days after

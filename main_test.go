@@ -51,3 +51,27 @@ func TestSetupCommandMacOS(t *testing.T) {
 		t.Fatalf("setupCommand() = %q", got)
 	}
 }
+
+func TestRuntimeReadiness(t *testing.T) {
+	tests := []struct {
+		name         string
+		backend      string
+		capabilities []string
+		wantRuntime  string
+		wantReady    bool
+	}{
+		{name: "CUDA with Docker", backend: "cuda", capabilities: []string{"docker", "workspace"}, wantRuntime: "docker", wantReady: true},
+		{name: "CUDA without Docker", backend: "cuda", capabilities: []string{"ollama"}, wantRuntime: "docker", wantReady: false},
+		{name: "Metal with Ollama", backend: "metal", capabilities: []string{"ollama"}, wantRuntime: "ollama", wantReady: true},
+		{name: "CPU without Ollama", backend: "cpu", capabilities: nil, wantRuntime: "ollama", wantReady: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtimeName, ready := runtimeReadiness(test.backend, test.capabilities)
+			if runtimeName != test.wantRuntime || ready != test.wantReady {
+				t.Fatalf("runtimeReadiness() = (%q, %v), want (%q, %v)", runtimeName, ready, test.wantRuntime, test.wantReady)
+			}
+		})
+	}
+}

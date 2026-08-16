@@ -22,10 +22,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/tokenize/gpu-agent/internal/dockermgr"
-	"github.com/tokenize/gpu-agent/internal/gpu"
-	"github.com/tokenize/gpu-agent/internal/job"
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
+	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
+	"github.com/RunGPU-io/rungpu-agent/internal/job"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func log(format string, args ...interface{}) {

@@ -3,10 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestSaveLoadRoundTrip(t *testing.T) {
@@ -109,8 +110,20 @@ func TestSaveCreatesFileWith0600(t *testing.T) {
 	perm := info.Mode().Perm()
 	// On Unix, should be 0600 (owner read/write only).
 	// On Windows, file permissions work differently — skip the check.
-	if perm&0o077 != 0 {
+	if configPermissionsNeedWarning(runtime.GOOS, perm) {
 		t.Errorf("config file permissions = %o, want 0600 (no group/other access)", perm)
+	}
+}
+
+func TestConfigPermissionsNeedWarning(t *testing.T) {
+	if configPermissionsNeedWarning("windows", 0o666) {
+		t.Fatal("Windows permissions should not produce a Unix chmod warning")
+	}
+	if !configPermissionsNeedWarning("linux", 0o666) {
+		t.Fatal("world-readable Unix config should produce a warning")
+	}
+	if configPermissionsNeedWarning("darwin", 0o600) {
+		t.Fatal("owner-only Unix config should not produce a warning")
 	}
 }
 

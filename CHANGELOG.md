@@ -5,8 +5,15 @@ security details are intentionally excluded.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-16
+
 - Added optional public GPU contribution at no charge. Hosts can contribute
 	without payout setup, or choose paid hosting after completing Stripe setup.
+- Expanded `status` with enrollment, runtime readiness, and capability
+	diagnostics plus an actionable setup recommendation.
+- Added installation troubleshooting for Docker, WSL 2, security software,
+	enrollment, permissions, and connectivity.
+- Removed an incorrect Unix file-permission warning on Windows.
 
 ## [1.2.0] - 2026-08-16
 

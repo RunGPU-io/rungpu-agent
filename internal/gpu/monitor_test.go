@@ -3,7 +3,7 @@ package gpu
 import (
 	"testing"
 
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestSplitCSV(t *testing.T) {

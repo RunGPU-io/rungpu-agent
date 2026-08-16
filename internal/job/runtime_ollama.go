@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokenize/gpu-agent/internal/types"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 const defaultOllamaEndpoint = "http://localhost:11434"
