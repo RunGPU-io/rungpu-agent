@@ -2,6 +2,15 @@
 // with the pool coordinator (raw WebSocket, JSON frames of {type, ...payload}).
 package types
 
+import (
+	"fmt"
+	"regexp"
+)
+
+const JobProtocolVersion = 2
+
+var safeJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 // ── Configuration (persisted as YAML) ────────────────────────────────────────
 
 type MetricsConfig struct {
@@ -45,7 +54,7 @@ type Config struct {
 	JobTimeoutMinutes int `yaml:"job_timeout_minutes"`
 
 	// MaxCustomFileGB caps the size of any single downloaded custom file
-	// (LoRA, checkpoint, workflow). 0 → unlimited.
+	// (safe model asset or workflow). 0 → unlimited.
 	MaxCustomFileGB int `yaml:"max_custom_file_gb"`
 
 	Metrics  MetricsConfig  `yaml:"metrics"`
@@ -80,13 +89,16 @@ type Envelope struct {
 
 // JobAssignment is pushed by the server down the open socket.
 type JobAssignment struct {
-	Type           string                 `json:"type"`
-	JobID          string                 `json:"job_id"`
-	ModelName      string                 `json:"model_name"`
-	ModelURL       string                 `json:"model_url,omitempty"`
-	Input          map[string]interface{} `json:"input"`
-	Parameters     map[string]interface{} `json:"parameters"`
-	VRAMRequiredGB float64                `json:"vram_required_gb"`
+	ProtocolVersion int                    `json:"protocol_version,omitempty"`
+	Type            string                 `json:"type"`
+	JobID           string                 `json:"job_id"`
+	ModelName       string                 `json:"model_name"`
+	Runtime         string                 `json:"runtime,omitempty"`
+	Source          string                 `json:"source,omitempty"`
+	ModelURL        string                 `json:"model_url,omitempty"`
+	Input           map[string]interface{} `json:"input"`
+	Parameters      map[string]interface{} `json:"parameters"`
+	VRAMRequiredGB  float64                `json:"vram_required_gb"`
 
 	// ── Docker image source ─────────────────────────────────────────────
 	// The image to run. Can be:
@@ -97,7 +109,7 @@ type JobAssignment struct {
 
 	// ── Custom files to inject into the container ───────────────────────
 	// Each entry is a URL to download → mount path inside the container.
-	// Used for LoRAs, ComfyUI workflows, custom checkpoints, etc.
+	// Used for safetensors, ComfyUI workflows, and reference inputs.
 	//   e.g. [{"url": "https://civitai.com/api/download/models/123", "path": "/models/loras/my.safetensors"}]
 	CustomFiles []CustomFile `json:"custom_files,omitempty"`
 
@@ -111,6 +123,29 @@ type JobAssignment struct {
 	// instead of running a batch job and exiting.
 	Workspace bool     `json:"workspace,omitempty"`
 	Ports     []string `json:"ports,omitempty"` // e.g. ["8188:8188"]
+}
+
+func (a JobAssignment) Validate() error {
+	if a.ProtocolVersion < 0 || a.ProtocolVersion > JobProtocolVersion {
+		return fmt.Errorf("unsupported job protocol version %d", a.ProtocolVersion)
+	}
+	if !safeJobID.MatchString(a.JobID) {
+		return fmt.Errorf("invalid job_id")
+	}
+	if a.ModelName == "" {
+		return fmt.Errorf("model_name is required")
+	}
+	if a.ProtocolVersion >= 1 && a.Runtime == "" {
+		return fmt.Errorf("runtime is required by job protocol version %d", a.ProtocolVersion)
+	}
+	if a.ProtocolVersion >= 2 {
+		for _, file := range a.CustomFiles {
+			if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(file.SHA256) {
+				return fmt.Errorf("custom file sha256 is required by job protocol version %d", a.ProtocolVersion)
+			}
+		}
+	}
+	return nil
 }
 
 // JobControl is a server→agent control message to stop/cancel a running job or
@@ -140,9 +175,10 @@ type AssetCleanupResult struct {
 
 // CustomFile is a file to download and inject into the container.
 type CustomFile struct {
-	URL  string `json:"url"`  // download URL (HuggingFace, Civitai, direct link)
-	Path string `json:"path"` // mount path inside container (e.g. "/models/loras/my.safetensors")
-	Name string `json:"name"` // human-readable name (optional)
+	URL    string `json:"url"`    // download URL (HuggingFace, Civitai, direct link)
+	Path   string `json:"path"`   // mount path inside container (e.g. "/models/loras/my.safetensors")
+	Name   string `json:"name"`   // human-readable name (optional)
+	SHA256 string `json:"sha256"` // expected lowercase SHA-256 of the downloaded bytes
 }
 
 // JobResult is sent back by the agent when a job finishes.

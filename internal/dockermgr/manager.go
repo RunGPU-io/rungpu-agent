@@ -26,16 +26,17 @@ func NewWithPolicy(policy SecurityPolicy) *Manager {
 
 // RunOptions configures a detached container run.
 type RunOptions struct {
-	Image   string
-	Name    string
-	Env     map[string]string
-	Mounts  []string // "hostPath:containerPath[:ro]" (bind mounts)
-	Volumes []string // "namedVolume:containerPath" (Docker named volumes — persistent)
-	Ports   []string // "hostPort:containerPort"
-	UseGPU  bool
-	GPUDevice string // "" or "all" → all GPUs; else passed as --gpus device=<GPUDevice>
-	ShmSize string   // shared memory size (e.g. "8g")
-	Command []string // override CMD
+	Image     string
+	Name      string
+	Env       map[string]string
+	Mounts    []string // "hostPath:containerPath[:ro]" (bind mounts)
+	Volumes   []string // "namedVolume:containerPath" (Docker named volumes — persistent)
+	Ports     []string // "hostPort:containerPort"
+	Network   string   // required: "none" for batch jobs or "bridge" for workspaces
+	UseGPU    bool
+	GPUDevice string   // "" or "all" → all GPUs; else passed as --gpus device=<GPUDevice>
+	ShmSize   string   // shared memory size (e.g. "8g")
+	Command   []string // override CMD
 }
 
 // Run starts a sandboxed detached container and returns its ID.
@@ -47,6 +48,9 @@ func (m *Manager) Run(ctx context.Context, opts RunOptions) (string, error) {
 	}
 	if err := ValidateMounts(opts.Mounts); err != nil {
 		return "", fmt.Errorf("security: %w", err)
+	}
+	if opts.Network != "none" && opts.Network != "bridge" {
+		return "", fmt.Errorf("security: container network must be none or bridge")
 	}
 
 	// ── Build docker run command ────────────────────────────────────────
@@ -66,6 +70,7 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 
 	// Sandbox args (always applied — renter cannot override)
 	args = append(args, SandboxArgs(m.Policy)...)
+	args = append(args, "--network", opts.Network)
 
 	if opts.UseGPU {
 		// Scope to a specific device when configured so a single job on a

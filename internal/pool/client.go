@@ -32,6 +32,13 @@ func log(format string, args ...interface{}) {
 	stdlog.Printf("[agent] "+format, args...)
 }
 
+func shortJobRef(jobID string) string {
+	if len(jobID) > 12 {
+		return jobID[:12]
+	}
+	return jobID
+}
+
 // WebSocket keepalive tuning. The agent pings periodically; if no pong (or any
 // other frame) arrives within pongWait the read fails and we reconnect — so a
 // half-open TCP connection is detected in ~1 minute instead of hanging.
@@ -139,7 +146,7 @@ func newClientForGPU(cfg *types.Config, deviceIndex int, maintenanceGate *sync.R
 	// Relay job progress to the coordinator (best-effort — dropped if the outbox
 	// is full, so slow delivery never blocks inference).
 	executor.OnProgress = func(p types.JobProgress) {
-		log("job %s: [%s] %.0f%% — %s", p.JobID, p.Stage, p.Progress*100, p.Message)
+		log("job %s: stage=%s progress=%.0f%%", shortJobRef(p.JobID), p.Stage, p.Progress*100)
 		c.enqueue(p)
 	}
 
@@ -389,6 +396,10 @@ func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data [
 			log("bad job_assignment: %v", err)
 			return
 		}
+		if err := a.Validate(); err != nil {
+			log("rejected job_assignment: %v", err)
+			return
+		}
 		hasMaintenanceLease := c.maintenanceGate != nil && c.maintenanceGate.TryRLock()
 		if c.maintenanceGate != nil && !hasMaintenanceLease {
 			c.enqueue(types.JobResult{Type: "job_result", JobID: a.JobID, GPUID: c.gpuID, Error: "GPU is in maintenance"})
@@ -412,9 +423,10 @@ func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data [
 		go c.executor.Cancel(jc.JobID)
 	case "job_result_ack":
 		var ack struct {
-			JobID string `json:"job_id"`
+			JobID   string `json:"job_id"`
+			Success bool   `json:"success"`
 		}
-		if json.Unmarshal(data, &ack) == nil && ack.JobID != "" {
+		if json.Unmarshal(data, &ack) == nil && ack.JobID != "" && ack.Success {
 			_ = os.Remove(c.resultPath(ack.JobID))
 		}
 	case "asset_cleanup":
@@ -481,14 +493,19 @@ func (c *Client) runJob(a types.JobAssignment, hasMaintenanceLease bool) {
 	atomic.AddInt64(&c.activeJobs, 1)
 	defer atomic.AddInt64(&c.activeJobs, -1)
 
-	log("starting job %s (%s)", a.JobID, a.ModelName)
+	jobRef := shortJobRef(a.JobID)
+	source := a.Source
+	if source == "" {
+		source = "RunGPU customer"
+	}
+	log("received job %s from %s: model=%q runtime=%s custom_assets=%d workspace=%t", jobRef, source, a.ModelName, c.executor.Runtime(), len(a.CustomFiles), a.Workspace)
 	// Run under the process-lifetime context so a reconnect doesn't abort the
 	// job. Cancellation still happens via the executor (job_cancel / shutdown).
 	result := c.executor.Execute(c.baseCtx, a)
 	if result.Success {
-		log("job %s completed in %dms", a.JobID, result.DurationMS)
+		log("job %s completed in %dms", jobRef, result.DurationMS)
 	} else {
-		log("job %s failed: %s", a.JobID, result.Error)
+		log("job %s failed after %dms", jobRef, result.DurationMS)
 	}
 	// Deliver via the persistent outbox (blocking, so the result is never
 	// dropped — it waits for a live session if we're momentarily disconnected).

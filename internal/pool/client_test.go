@@ -1,11 +1,32 @@
 package pool
 
 import (
+	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
+
+func TestJobResultAckOnlyRemovesAcceptedResult(t *testing.T) {
+	client := &Client{outboxDir: t.TempDir()}
+	resultPath := filepath.Join(client.outboxDir, "job-1.json")
+	if err := os.WriteFile(resultPath, []byte(`{"job_id":"job-1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client.dispatch(context.Background(), make(chan interface{}, 1), []byte(`{"type":"job_result_ack","job_id":"job-1","success":false}`))
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("rejected result ACK removed durable result: %v", err)
+	}
+
+	client.dispatch(context.Background(), make(chan interface{}, 1), []byte(`{"type":"job_result_ack","job_id":"job-1","success":true}`))
+	if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
+		t.Fatalf("accepted result ACK did not remove durable result: %v", err)
+	}
+}
 
 func TestEndpoint(t *testing.T) {
 	cases := []struct {

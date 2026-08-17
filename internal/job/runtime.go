@@ -23,6 +23,7 @@ type Runtime interface {
 type multiRuntime struct {
 	ollama       Runtime // text LLMs via Ollama
 	dockerCustom Runtime // batch inference (video/image gen)
+	comfyUIBatch Runtime // public ComfyUI API workflows on the internal image
 	workspace    Runtime // long-running interactive (ComfyUI, Jupyter)
 	hasOllama    bool
 	hasDocker    bool
@@ -31,8 +32,8 @@ type multiRuntime struct {
 
 // RuntimeOptions tunes container execution beyond the basic backend/cache args.
 type RuntimeOptions struct {
-	GPUDevice  string                    // "" or "all" → all GPUs; else --gpus device=<GPUDevice>
-	JobTimeout time.Duration             // batch job cap; 0 → 60m default
+	GPUDevice  string                   // "" or "all" → all GPUs; else --gpus device=<GPUDevice>
+	JobTimeout time.Duration            // batch job cap; 0 → 60m default
 	Policy     dockermgr.SecurityPolicy // container sandbox policy (zero value == DefaultPolicy)
 }
 
@@ -42,28 +43,15 @@ func NewRuntime(backend, cacheDir string, maxCacheGB int) (Runtime, error) {
 }
 
 // NewRuntimeOpts creates a runtime that can handle multiple model types:
-//   - Text LLMs → Ollama (auto-installed if missing)
+//   - Text LLMs → Ollama
 //   - Video/image generation → Docker custom image (batch)
 //   - Interactive environments (ComfyUI, Jupyter) → Docker workspace (long-running with ports)
 //
-// If Ollama is not installed, the agent will automatically install it.
-// Docker is not auto-installed (requires more complex setup).
+// Runtime requirements are installed only through the explicit setup command.
 func NewRuntimeOpts(backend, cacheDir string, maxCacheGB int, opts RuntimeOptions) (Runtime, error) {
-	hasOllama := exec.Command("ollama", "--version").Run() == nil
-	hasDocker := exec.Command("docker", "version").Run() == nil
+	hasOllama := runtimeCommandAvailable("ollama", "--version")
+	hasDocker := runtimeCommandAvailable("docker", "version")
 	useGPU := strings.ToLower(backend) == "cuda"
-
-	// Auto-install Ollama if not present
-	if !hasOllama {
-		fmt.Println("[runtime] Ollama not found — installing automatically...")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		if err := installOllama(ctx); err != nil {
-			fmt.Printf("[runtime] ⚠ Ollama auto-install failed: %v\n", err)
-		} else {
-			hasOllama = true
-		}
-	}
 
 	mr := &multiRuntime{
 		hasOllama: hasOllama,
@@ -76,12 +64,13 @@ func NewRuntimeOpts(backend, cacheDir string, maxCacheGB int, opts RuntimeOption
 	}
 	if hasDocker {
 		mr.dockerCustom = newCustomDockerRuntime(cacheDir, useGPU, opts.GPUDevice, opts.JobTimeout, opts.Policy)
+		mr.comfyUIBatch = newComfyUIBatchRuntime(cacheDir, useGPU, opts.GPUDevice, opts.Policy)
 		mr.workspace = newWorkspaceRuntime(cacheDir, useGPU, opts.GPUDevice, opts.Policy)
 	}
 
 	if !hasOllama && !hasDocker {
 		fmt.Println("[runtime] WARNING: neither ollama nor docker found")
-		fmt.Println("  Ollama auto-install failed — install manually: https://ollama.com/download")
+		fmt.Println("  Install runtime requirements with: rungpu-agent setup")
 		fmt.Println("  Install docker for video/image/workspace jobs: https://docs.docker.com/get-docker/")
 	} else {
 		if hasOllama {
@@ -97,6 +86,12 @@ func NewRuntimeOpts(backend, cacheDir string, maxCacheGB int, opts RuntimeOption
 	}
 
 	return mr, nil
+}
+
+func runtimeCommandAvailable(name string, args ...string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run() == nil
 }
 
 func (m *multiRuntime) Name() string {
@@ -119,6 +114,42 @@ func (m *multiRuntime) Name() string {
 //  2. docker_image param or known video/image model → custom Docker runtime (batch)
 //  3. Everything else → Ollama (text LLMs)
 func (m *multiRuntime) selectRuntime(a types.JobAssignment) (Runtime, error) {
+	if a.Runtime != "" {
+		switch a.Runtime {
+		case "comfyui-batch":
+			if m.comfyUIBatch != nil {
+				return m.comfyUIBatch, nil
+			}
+			return nil, fmt.Errorf("ComfyUI workflow jobs require Docker on the GPU host")
+		case "workspace":
+			if m.workspace != nil {
+				return m.workspace, nil
+			}
+			return nil, fmt.Errorf("workspace jobs require Docker")
+		case "docker-custom":
+			if m.dockerCustom != nil {
+				return m.dockerCustom, nil
+			}
+			return nil, fmt.Errorf("Docker batch jobs require Docker on the GPU host")
+		case "ollama":
+			if m.ollama != nil {
+				return m.ollama, nil
+			}
+			return nil, fmt.Errorf("text inference jobs require Ollama on the GPU host")
+		default:
+			return nil, fmt.Errorf("unsupported execution runtime %q", a.Runtime)
+		}
+	}
+
+	// Compatibility for assignments created by coordinators before runtime
+	// became an explicit wire-protocol field.
+	if isComfyUIBatchJob(a) {
+		if m.comfyUIBatch != nil {
+			return m.comfyUIBatch, nil
+		}
+		return nil, fmt.Errorf("ComfyUI workflow jobs require Docker on the GPU host")
+	}
+
 	// Check for workspace mode
 	if isWorkspaceJob(a) {
 		if m.workspace != nil {
@@ -146,6 +177,14 @@ func (m *multiRuntime) selectRuntime(a types.JobAssignment) (Runtime, error) {
 	}
 
 	return nil, fmt.Errorf("no runtime available for model %q — install ollama (text LLMs) or docker (video/image/workspace)", a.ModelName)
+}
+
+func isComfyUIBatchJob(a types.JobAssignment) bool {
+	if a.Parameters == nil {
+		return false
+	}
+	runtimeName, _ := a.Parameters["runtime"].(string)
+	return runtimeName == "comfyui-batch"
 }
 
 // isWorkspaceJob returns true if the job should run as a long-lived workspace.
@@ -189,9 +228,10 @@ func isKnownDockerModel(name string) bool {
 	lower := strings.ToLower(name)
 	dockerModels := []string{
 		"ltx", "ltx-video", "ltx2", "ltx2-video",
-		"wan2", "wan2.1", "wan2-video",
+		"wan2", "wan2.1", "wan2.2", "wan2-video",
 		"stable-diffusion", "sdxl", "sd", "sd3",
 		"flux", "flux.1", "flux-dev", "flux-schnell",
+		"z-image", "qwen-image", "hidream",
 		"whisper", "musicgen",
 	}
 	for _, m := range dockerModels {
@@ -229,6 +269,9 @@ func (m *multiRuntime) Cleanup(force bool) error {
 	}
 	if m.dockerCustom != nil {
 		m.dockerCustom.Cleanup(force)
+	}
+	if m.comfyUIBatch != nil {
+		m.comfyUIBatch.Cleanup(force)
 	}
 	return nil
 }

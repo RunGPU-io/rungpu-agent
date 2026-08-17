@@ -393,6 +393,8 @@ func cmdStart(args []string) error {
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 
+	fmt.Println("RunGPU Agent starting...")
+	fmt.Printf("Loading configuration: %s\n", *cfgPath)
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
@@ -407,6 +409,7 @@ func cmdStart(args []string) error {
 		}
 	}
 
+	fmt.Println("Detecting GPU and runtime capabilities...")
 	clients, err := pool.NewClients(cfg)
 	if err != nil {
 		return err
@@ -448,13 +451,14 @@ func cmdStatus(args []string) error {
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 
+	fmt.Println("\n=== RunGPU Agent Status ===")
+	fmt.Println("Checking GPU and runtime capabilities...")
 	monitor := gpu.NewMonitor()
 	gpus := monitor.GPUs()
 	backend := monitor.Backend()
 	capabilities := gpu.RuntimeCapabilities()
 	requiredRuntime, runtimeReady := runtimeReadiness(backend, capabilities)
 
-	fmt.Println("\n=== RunGPU Agent Status ===")
 	if cfg, err := config.Load(*cfgPath); err == nil && cfg.APIKey != "" && cfg.MachineID != "" {
 		fmt.Printf("Enrollment: Configured (%s)\n", cfg.MachineID)
 	} else {

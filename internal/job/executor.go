@@ -129,7 +129,7 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	}()
 	ctx = jobCtx
 
-	// ── Stage 1: Download custom files (LoRAs, workflows, checkpoints) ──
+	// ── Stage 1: Download verified custom files ────────────────────────
 	if len(a.CustomFiles) > 0 {
 		e.progress(a.JobID, "downloading_files", 0, "Downloading custom files...")
 		stagingDir := e.cacheDir + "/staging/" + a.JobID

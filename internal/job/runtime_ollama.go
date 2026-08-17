@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -165,120 +164,24 @@ func (r *ollamaRuntime) isModelCached(ctx context.Context, model string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// installOllama automatically installs Ollama on macOS and Linux.
-// On macOS it uses Homebrew (if available) or the official install script.
-// On Linux it uses the official install script (curl | sh).
-// Windows is not supported for auto-install — users must install manually.
+// installOllama preserves the existing setup probe for diagnostics and tests.
+// Installation is intentionally restricted to the explicit setup command.
 func installOllama(ctx context.Context) error {
-	// Already installed? Nothing to do.
+	_ = ctx
 	if _, err := exec.LookPath("ollama"); err == nil {
 		return nil
 	}
-
-	switch rt.GOOS {
-	case "darwin":
-		return installOllamaDarwin(ctx)
-	case "linux":
-		return installOllamaLinux(ctx)
-	default:
-		return fmt.Errorf("automatic Ollama installation is not supported on %s — install manually from https://ollama.com/download", rt.GOOS)
-	}
+	return fmt.Errorf("ollama is not installed; run rungpu-agent setup")
 }
 
-// installOllamaDarwin installs Ollama on macOS.
-// Tries Homebrew first (most common on dev machines), falls back to the
-// official install script.
-func installOllamaDarwin(ctx context.Context) error {
-	// Try Homebrew first — it's the cleanest install path on macOS
-	if _, err := exec.LookPath("brew"); err == nil {
-		fmt.Println("[ollama] Installing via Homebrew...")
-		cmd := exec.CommandContext(ctx, "brew", "install", "ollama")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err == nil {
-			// Verify it worked
-			if _, err := exec.LookPath("ollama"); err == nil {
-				fmt.Println("[ollama] ✅ Installed successfully via Homebrew")
-				return nil
-			}
-		}
-		fmt.Println("[ollama] Homebrew install failed, trying official installer...")
-	}
-
-	// Fall back to the official install script
-	return installOllamaViaScript(ctx)
-}
-
-// installOllamaLinux installs Ollama on Linux using the official install script.
-func installOllamaLinux(ctx context.Context) error {
-	if output, err := exec.Command("id", "-u").Output(); err == nil && strings.TrimSpace(string(output)) != "0" {
-		return fmt.Errorf("automatic Ollama installation on Linux requires root privileges; reinstall the agent with sudo ./scripts/install.sh")
-	}
-	return installOllamaViaScript(ctx)
-}
-
-// installOllamaViaScript downloads and runs the official Ollama install script.
-// This is the recommended install method from https://ollama.com/download
-func installOllamaViaScript(ctx context.Context) error {
-	fmt.Println("[ollama] Downloading official installer from https://ollama.com/install.sh ...")
-
-	// Download the install script
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://ollama.com/install.sh", nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to download Ollama installer: %w\n"+
-			"  Install manually: https://ollama.com/download", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Ollama installer returned HTTP %d\n"+
-			"  Install manually: https://ollama.com/download", resp.StatusCode)
-	}
-
-	script, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read installer script: %w", err)
-	}
-
-	// Run the install script via sh
-	fmt.Println("[ollama] Running installer (may require sudo)...")
-	cmd := exec.CommandContext(ctx, "sh", "-c", string(script))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin // Allow sudo password prompt
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("Ollama installation failed: %w\n"+
-			"  Install manually: https://ollama.com/download", err)
-	}
-
-	// Verify installation
-	if _, err := exec.LookPath("ollama"); err != nil {
-		return fmt.Errorf("Ollama was installed but binary not found in PATH\n" +
-			"  Try restarting your terminal or install manually: https://ollama.com/download")
-	}
-
-	fmt.Println("[ollama] ✅ Installed successfully")
-	return nil
-}
-
-// Prepare ensures the model is available locally. Installs Ollama if needed,
-// starts the server if needed, checks the cache, and pulls the model if not present.
+// Prepare ensures the model is available locally, starts the server if needed,
+// checks the cache, and pulls the model if not present.
 func (r *ollamaRuntime) Prepare(ctx context.Context, a types.JobAssignment) error {
 	model := ollamaModel(a)
 
-	// 1. Check if ollama binary exists — auto-install if not
+	// 1. Check if ollama binary exists.
 	if _, err := exec.LookPath("ollama"); err != nil {
-		fmt.Println("[ollama] Not installed — attempting automatic installation...")
-		if installErr := installOllama(ctx); installErr != nil {
-			return fmt.Errorf("ollama not installed and auto-install failed: %w", installErr)
-		}
+		return fmt.Errorf("ollama is not installed; run rungpu-agent setup")
 	}
 
 	// 2. Ensure the Ollama server is running (auto-start if needed)

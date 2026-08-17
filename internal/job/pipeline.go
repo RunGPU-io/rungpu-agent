@@ -2,7 +2,7 @@
 //
 //  1. Resolve Docker image (from HuggingFace URL, well-known name, or explicit)
 //  2. Pull image (cached — skip if already present)
-//  3. Download custom files (LoRAs, workflows, checkpoints) into a staging dir
+//  3. Download verified custom files (safe model assets and workflows) into staging
 //  4. Start container with GPU, mounts, env vars
 //  5. Wait for completion (or keep running for workspace mode)
 //  6. Collect output files from container
@@ -16,9 +16,11 @@ package job
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,9 +98,13 @@ var TrustedFileHosts = []string{
 	"storage.googleapis.com",
 }
 
+var TrustedUploadHosts = []string{"storage.googleapis.com"}
+
+var allowInsecureLoopbackForTests bool
+
 // SafeFileExtensions are the only file types we allow downloading.
 var SafeFileExtensions = []string{
-	".safetensors", ".ckpt", ".pt", ".pth", ".bin", // model weights
+	".safetensors",                    // model weights without executable pickle payloads
 	".json", ".yaml", ".yml", ".toml", // configs, workflows
 	".png", ".jpg", ".jpeg", ".webp", // reference images
 	".txt", ".csv", // prompts, metadata
@@ -107,31 +113,7 @@ var SafeFileExtensions = []string{
 // ValidateCustomFileURL checks that a download URL is from a trusted source
 // and the target path doesn't escape the staging directory.
 func ValidateCustomFileURL(url, path string) error {
-	lower := strings.ToLower(url)
-
-	// Must be HTTPS (no HTTP, no file://, no ftp://)
-	if !strings.HasPrefix(lower, "https://") {
-		return fmt.Errorf("custom file URL must use HTTPS: %s", url)
-	}
-
-	// Check against trusted hosts
-	host := strings.TrimPrefix(lower, "https://")
-	if idx := strings.IndexByte(host, '/'); idx > 0 {
-		host = host[:idx]
-	}
-	// Remove port if present
-	if idx := strings.IndexByte(host, ':'); idx > 0 {
-		host = host[:idx]
-	}
-
-	trusted := false
-	for _, th := range TrustedFileHosts {
-		if host == th || strings.HasSuffix(host, "."+th) {
-			trusted = true
-			break
-		}
-	}
-	if !trusted {
+	if err := validateHTTPSHost(url, TrustedFileHosts); err != nil {
 		return fmt.Errorf("custom file URL %q is not from a trusted source. Allowed: %s",
 			url, strings.Join(TrustedFileHosts, ", "))
 	}
@@ -148,7 +130,7 @@ func ValidateCustomFileURL(url, path string) error {
 			break
 		}
 	}
-	if !validExt && ext != "" {
+	if !validExt {
 		return fmt.Errorf("file extension %q is not allowed. Allowed: %s",
 			ext, strings.Join(SafeFileExtensions, ", "))
 	}
@@ -162,13 +144,41 @@ func ValidateCustomFileURL(url, path string) error {
 	return nil
 }
 
-// DownloadCustomFiles downloads LoRAs, workflows, checkpoints into a staging
+func validateHTTPSHost(rawURL string, trustedHosts []string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Hostname() == "" {
+		return fmt.Errorf("URL must use HTTPS on the default port")
+	}
+	loopbackTestURL := allowInsecureLoopbackForTests && parsed.Scheme == "http" &&
+		(parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1")
+	if !loopbackTestURL && (parsed.Scheme != "https" || (parsed.Port() != "" && parsed.Port() != "443")) {
+		return fmt.Errorf("URL must use HTTPS on the default port")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for _, trustedHost := range trustedHosts {
+		if host == trustedHost || strings.HasSuffix(host, "."+trustedHost) {
+			return nil
+		}
+	}
+	return fmt.Errorf("untrusted URL host")
+}
+
+func trustedDownloadClient() *http.Client {
+	return &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		return validateHTTPSHost(req.URL.String(), TrustedFileHosts)
+	}}
+}
+
+// DownloadCustomFiles downloads safe model assets and workflows into a staging
 // directory. Only downloads from trusted sources with safe file extensions.
 func DownloadCustomFiles(ctx context.Context, files []types.CustomFile, stagingDir string, progress ProgressFunc) error {
 	return DownloadCustomFilesCached(ctx, files, stagingDir, "", progress)
 }
 
-// DownloadCustomFilesCached stores one immutable copy per URL in assetCacheDir
+// DownloadCustomFilesCached stores one immutable copy per digest in assetCacheDir
 // and stages links/copies for each job. An empty cache directory preserves the
 // legacy per-job behavior used by callers that do not own a persistent cache.
 func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, stagingDir, assetCacheDir string, progress ProgressFunc) error {
@@ -180,6 +190,9 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 	for _, f := range files {
 		if err := ValidateCustomFileURL(f.URL, f.Path); err != nil {
 			return fmt.Errorf("security: %w", err)
+		}
+		if !validSHA256(f.SHA256) {
+			return fmt.Errorf("security: custom file %q requires a lowercase SHA-256", f.Path)
 		}
 	}
 
@@ -218,30 +231,40 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 			return fmt.Errorf("create dir for %s: %w", f.Path, err)
 		}
 
-		// Skip if this job already has a complete staged file.
+		// Skip if this job already has the exact staged content.
 		if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
-			continue
+			if verifyFileSHA256(destPath, f.SHA256) == nil {
+				continue
+			}
+			_ = os.Remove(destPath)
 		}
 
 		cachePath := ""
 		if assetCacheDir != "" {
-			digest := sha256.Sum256([]byte(f.URL))
-			cachePath = filepath.Join(assetCacheDir, fmt.Sprintf("%x%s", digest, strings.ToLower(filepath.Ext(f.Path))))
+			cachePath = filepath.Join(assetCacheDir, f.SHA256+strings.ToLower(filepath.Ext(f.Path)))
 		}
 		sourcePath := cachePath
 		if sourcePath == "" {
 			sourcePath = destPath
 		}
 		if cachePath != "" {
-			if err := ensureCachedFile(ctx, f.URL, cachePath); err != nil {
+			if err := ensureCachedFile(ctx, f.URL, cachePath, f.SHA256); err != nil {
 				return fmt.Errorf("download %s: %w", name, err)
 			}
 			if err := stageCachedFile(cachePath, destPath); err != nil {
 				return fmt.Errorf("stage %s: %w", name, err)
 			}
+			if err := verifyFileSHA256(destPath, f.SHA256); err != nil {
+				_ = os.Remove(destPath)
+				return fmt.Errorf("verify %s: %w", name, err)
+			}
 		} else if info, statErr := os.Stat(sourcePath); statErr != nil || info.Size() == 0 {
 			if err := downloadFile(ctx, f.URL, sourcePath); err != nil {
 				return fmt.Errorf("download %s: %w", name, err)
+			}
+			if err := verifyFileSHA256(sourcePath, f.SHA256); err != nil {
+				_ = os.Remove(sourcePath)
+				return fmt.Errorf("verify %s: %w", name, err)
 			}
 		}
 	}
@@ -252,18 +275,51 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 	return nil
 }
 
-func ensureCachedFile(ctx context.Context, sourceURL, cachePath string) error {
+func ensureCachedFile(ctx context.Context, sourceURL, cachePath, expectedSHA256 string) error {
 	lockValue, _ := customAssetDownloadLocks.LoadOrStore(cachePath, &sync.Mutex{})
 	assetLock := lockValue.(*sync.Mutex)
 	assetLock.Lock()
 	defer assetLock.Unlock()
-	if info, err := os.Stat(cachePath); err != nil || info.Size() == 0 {
+	if info, err := os.Stat(cachePath); err != nil || info.Size() == 0 || verifyFileSHA256(cachePath, expectedSHA256) != nil {
+		_ = os.Remove(cachePath)
 		if err := downloadFile(ctx, sourceURL, cachePath); err != nil {
 			return err
 		}
 	}
+	if err := verifyFileSHA256(cachePath, expectedSHA256); err != nil {
+		_ = os.Remove(cachePath)
+		return err
+	}
 	now := time.Now()
 	return os.Chtimes(cachePath, now, now)
+}
+
+func validSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && hex.EncodeToString(decoded) == value
+}
+
+func verifyFileSHA256(path, expected string) error {
+	if !validSHA256(expected) {
+		return fmt.Errorf("invalid expected SHA-256")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return err
+	}
+	actual := hex.EncodeToString(hash.Sum(nil))
+	if actual != expected {
+		return fmt.Errorf("SHA-256 mismatch: expected %s, got %s", expected, actual)
+	}
+	return nil
 }
 
 // PruneCustomAssets removes expired files, then evicts least-recently-used
@@ -379,7 +435,7 @@ func downloadFile(ctx context.Context, url, dest string) error {
 		}
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := trustedDownloadClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -440,23 +496,36 @@ func UploadOutput(ctx context.Context, filePath, uploadURL string) error {
 		return nil
 	}
 
+	if err := validateHTTPSHost(uploadURL, TrustedUploadHosts); err != nil {
+		return fmt.Errorf("upload URL rejected: %w", err)
+	}
+	info, err := os.Lstat(filePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("output must be a regular file")
+	}
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open output file: %w", err)
 	}
 	defer f.Close()
 
-	info, _ := f.Stat()
+	openedInfo, err := f.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return fmt.Errorf("output file changed before upload")
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, f)
 	if err != nil {
 		return err
 	}
-	req.ContentLength = info.Size()
+	req.ContentLength = openedInfo.Size()
 
 	req.Header.Set("Content-Type", outputContentType(filePath))
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}

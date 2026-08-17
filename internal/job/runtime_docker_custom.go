@@ -123,6 +123,7 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	if _, runErr := r.docker.Run(ctx, dockermgr.RunOptions{
 		Image:     img,
 		Name:      containerName,
+		Network:   "none",
 		UseGPU:    r.useGPU,
 		GPUDevice: r.gpuDevice,
 		Mounts:    mounts,

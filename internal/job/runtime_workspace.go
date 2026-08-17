@@ -265,6 +265,7 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 	containerID, err := r.docker.Run(ctx, dockermgr.RunOptions{
 		Image:     image,
 		Name:      containerName,
+		Network:   "bridge",
 		UseGPU:    r.useGPU,
 		GPUDevice: r.gpuDevice,
 		Ports:     ports,

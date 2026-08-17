@@ -198,11 +198,11 @@ max_model_cache_gb: %d
 # How often to run cache cleanup (hours). Default: 24. Set to -1 to disable.
 cleanup_interval_hours: %d
 
-# Remove cached LoRAs, checkpoints, workflows, and stale job staging after this
+# Remove cached safe model assets, workflows, and stale job staging after this
 # many days without use. Default: 7. Set to -1 to disable age-based removal.
 custom_asset_ttl_days: %d
 
-# Maximum combined size of cached LoRAs, checkpoints, and workflows (GB).
+# Maximum combined size of cached model assets and workflows (GB).
 # When exceeded, least-recently-used assets are removed first. Set to -1 to
 # disable the size budget while retaining TTL cleanup.
 max_custom_asset_cache_gb: %d
@@ -220,7 +220,7 @@ allow_cpu_serving: %t
 # 0 = default (60 minutes). Workspace jobs (ComfyUI, Jupyter) are not affected.
 job_timeout_minutes: %d
 
-# Maximum size for a single custom file download — LoRA, checkpoint, etc. (GB).
+# Maximum size for a single verified custom file download (GB).
 # 0 = unlimited. Recommended: 10-20 GB to prevent abuse.
 max_custom_file_gb: %d
 

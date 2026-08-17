@@ -2,7 +2,9 @@ package job
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,12 @@ import (
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
+
+func TestMain(m *testing.M) {
+	allowInsecureLoopbackForTests = true
+	TrustedUploadHosts = append(TrustedUploadHosts, "127.0.0.1", "::1")
+	os.Exit(m.Run())
+}
 
 func TestResolveImage(t *testing.T) {
 	cases := []struct {
@@ -90,7 +98,7 @@ func TestValidateCustomFileURL(t *testing.T) {
 		{"https://huggingface.co/user/model/resolve/main/lora.safetensors", "models/loras/lora.safetensors"},
 		{"https://civitai.com/api/download/models/123", "models/loras/anime.safetensors"},
 		{"https://raw.githubusercontent.com/user/repo/main/workflow.json", "workflows/wf.json"},
-		{"https://storage.googleapis.com/bucket/model.bin", "models/model.bin"},
+		{"https://storage.googleapis.com/bucket/model.safetensors", "models/model.safetensors"},
 		{"https://cdn-lfs.huggingface.co/repos/abc/model.safetensors", "models/m.safetensors"},
 	}
 	for _, tc := range trusted {
@@ -118,6 +126,11 @@ func TestValidateCustomFileURL(t *testing.T) {
 	}
 	if err := ValidateCustomFileURL("https://huggingface.co/file.sh", "scripts/file.sh"); err == nil {
 		t.Error(".sh should be rejected")
+	}
+	for _, unsafe := range []string{"model.ckpt", "model.pt", "model.pth", "model.bin", "model.pkl"} {
+		if err := ValidateCustomFileURL("https://huggingface.co/"+unsafe, "models/"+unsafe); err == nil {
+			t.Errorf("%s should be rejected as an unsafe model format", unsafe)
+		}
 	}
 
 	// Path traversal should fail
@@ -180,10 +193,12 @@ func TestDownloadCustomFilesEmpty(t *testing.T) {
 }
 
 func TestEnsureCachedFileDownloadsOnceConcurrently(t *testing.T) {
+	content := []byte("shared asset")
+	expectedSHA256 := fmt.Sprintf("%x", sha256.Sum256(content))
 	var requests int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&requests, 1)
-		_, _ = w.Write([]byte("shared asset"))
+		_, _ = w.Write(content)
 	}))
 	defer server.Close()
 
@@ -194,7 +209,7 @@ func TestEnsureCachedFileDownloadsOnceConcurrently(t *testing.T) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			errors <- ensureCachedFile(context.Background(), server.URL, cachePath)
+			errors <- ensureCachedFile(context.Background(), server.URL, cachePath, expectedSHA256)
 		}()
 	}
 	workers.Wait()
@@ -206,6 +221,17 @@ func TestEnsureCachedFileDownloadsOnceConcurrently(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&requests); got != 1 {
 		t.Fatalf("network requests=%d, want 1", got)
+	}
+}
+
+func TestVerifyFileSHA256RejectsChangedContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "asset.safetensors")
+	if err := os.WriteFile(path, []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := fmt.Sprintf("%x", sha256.Sum256([]byte("expected")))
+	if err := verifyFileSHA256(path, expected); err == nil {
+		t.Fatal("expected changed content to fail SHA-256 verification")
 	}
 }
 

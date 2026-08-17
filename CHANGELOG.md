@@ -5,6 +5,20 @@ security details are intentionally excluded.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-16
+
+- Hardened assignment validation and generated-file handling.
+- Restricted managed downloads, redirects, and result uploads to approved
+	HTTPS destinations.
+- Isolated batch inference containers from outbound networks while preserving
+	explicit workspace networking.
+- Added SHA-256 verification and content-addressed caching for custom assets,
+	and rejected model formats capable of unsafe deserialization.
+- Removed runtime-triggered software installation. Runtime requirements are
+	now installed only through the explicit `setup` command.
+- Added compatibility checks for versioned coordinator job messages and
+	provenance attestations for release artifacts.
+
 ## [1.2.1] - 2026-08-16
 
 - Added optional public GPU contribution at no charge. Hosts can contribute

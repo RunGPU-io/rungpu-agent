@@ -98,6 +98,23 @@ docker run --rm hello-world
 If Windows is itself running inside a VM, the VM host must enable nested
 virtualization.
 
+### Windows: `start` or `status` prints nothing
+
+Run the executable directly from its extracted folder in PowerShell. Starting
+the installed Scheduled Task does not open a console and is silent by design.
+
+```powershell
+Unblock-File .\rungpu-agent-windows-amd64.exe
+.\rungpu-agent-windows-amd64.exe status *>&1 | Tee-Object .\rungpu-status.log
+.\rungpu-agent-windows-amd64.exe start
+```
+
+The command now prints before checking NVIDIA, Docker, or Ollama, and each
+external probe has a 10-second deadline. If an older release remains blank,
+press Ctrl+C and test `nvidia-smi -L` and `docker version` separately; whichever
+command hangs is the blocked driver/runtime. Start Docker Desktop and install
+current NVIDIA drivers before retrying.
+
 ### Connected, but setup is incomplete
 
 CUDA hosts require a running Docker engine. Apple Silicon hosts require Ollama.
@@ -131,7 +148,7 @@ from the host dashboard.
 
 ## Asset Retention
 
-Downloaded LoRAs, checkpoints, and workflows are cached for seven days after
+Downloaded safe model assets and workflows are cached for seven days after
 their last use, with a default 20 GB cache budget. Reusing an asset refreshes
 its age. When over budget, least-recently-used assets are removed first.
 Automatic cleanup runs only while every GPU on the machine is idle and never

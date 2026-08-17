@@ -59,10 +59,11 @@ func (r *dockerRuntime) Run(ctx context.Context, a types.JobAssignment) (map[str
 	containerName := "tokenize-job-" + a.JobID
 
 	if _, err := r.docker.Run(ctx, dockermgr.RunOptions{
-		Image:  workerImage,
-		Name:   containerName,
-		UseGPU: true,
-		Mounts: []string{r.cacheDir + ":/models:ro"},
+		Image:   workerImage,
+		Name:    containerName,
+		Network: "none",
+		UseGPU:  true,
+		Mounts:  []string{r.cacheDir + ":/models:ro"},
 		Env: map[string]string{
 			"JOB_ID":     a.JobID,
 			"MODEL_PATH": "/models/" + id,

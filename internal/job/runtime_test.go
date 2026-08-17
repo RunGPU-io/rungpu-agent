@@ -134,6 +134,111 @@ func TestHasExplicitDockerImage(t *testing.T) {
 	}
 }
 
+func TestIsComfyUIBatchJob(t *testing.T) {
+	job := types.JobAssignment{Parameters: map[string]interface{}{"runtime": "comfyui-batch"}}
+	if !isComfyUIBatchJob(job) {
+		t.Fatal("explicit comfyui-batch runtime should be detected")
+	}
+	if isComfyUIBatchJob(types.JobAssignment{}) {
+		t.Fatal("job without an explicit runtime should not use ComfyUI batch")
+	}
+
+	comfy := &comfyUIBatchRuntime{}
+	runtime, err := (&multiRuntime{comfyUIBatch: comfy, dockerCustom: &customDockerRuntime{}}).selectRuntime(types.JobAssignment{
+		ModelName: "stable-diffusion", DockerImage: "renter/image:latest",
+		Parameters: map[string]interface{}{"runtime": "comfyui-batch"},
+	})
+	if err != nil || runtime != comfy {
+		t.Fatalf("ComfyUI batch selection = %T, %v", runtime, err)
+	}
+	if _, err := (&multiRuntime{}).selectRuntime(job); err == nil || !strings.Contains(err.Error(), "require Docker") {
+		t.Fatalf("missing ComfyUI batch runtime error = %v", err)
+	}
+}
+
+func TestExplicitRuntimeSelection(t *testing.T) {
+	ollama := &ollamaRuntime{}
+	docker := &customDockerRuntime{}
+	workspace := &workspaceRuntime{}
+	comfy := &comfyUIBatchRuntime{}
+	runtimes := &multiRuntime{ollama: ollama, dockerCustom: docker, workspace: workspace, comfyUIBatch: comfy}
+
+	for runtimeName, expected := range map[string]Runtime{
+		"ollama": ollama, "docker-custom": docker, "workspace": workspace, "comfyui-batch": comfy,
+	} {
+		selected, err := runtimes.selectRuntime(types.JobAssignment{Runtime: runtimeName, ModelName: "misleading-video-name"})
+		if err != nil || selected != expected {
+			t.Fatalf("runtime %q selected %T, %v", runtimeName, selected, err)
+		}
+	}
+	if _, err := runtimes.selectRuntime(types.JobAssignment{Runtime: "unknown"}); err == nil {
+		t.Fatal("unknown explicit runtime should be rejected")
+	}
+}
+
+func TestInjectComfyPrompt(t *testing.T) {
+	withPlaceholder := map[string]interface{}{
+		"1": map[string]interface{}{"inputs": map[string]interface{}{"text": "Create {{prompt}} now"}},
+	}
+	if !injectComfyPrompt(withPlaceholder, "a red kite") {
+		t.Fatal("placeholder workflow should accept a prompt")
+	}
+	text := withPlaceholder["1"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	if text != "Create a red kite now" {
+		t.Fatalf("placeholder result = %q", text)
+	}
+
+	clipWorkflow := map[string]interface{}{
+		"negative": map[string]interface{}{
+			"class_type": "CLIPTextEncode",
+			"_meta":      map[string]interface{}{"title": "Negative Prompt"},
+			"inputs":     map[string]interface{}{"text": "blurry"},
+		},
+		"positive": map[string]interface{}{
+			"class_type": "CLIPTextEncode",
+			"_meta":      map[string]interface{}{"title": "Positive Prompt"},
+			"inputs":     map[string]interface{}{"text": "old prompt"},
+		},
+	}
+	if !injectComfyPrompt(clipWorkflow, "a glass city") {
+		t.Fatal("CLIPTextEncode workflow should accept a prompt")
+	}
+	positive := clipWorkflow["positive"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	negative := clipWorkflow["negative"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	if positive != "a glass city" || negative != "blurry" {
+		t.Fatalf("unexpected prompt injection: positive=%q negative=%q", positive, negative)
+	}
+}
+
+func TestSafeComfyOutputPath(t *testing.T) {
+	root := t.TempDir()
+	path, err := safeComfyOutputPath(root, "videos", "result.mp4")
+	if err != nil || path != filepath.Join(root, "videos", "result.mp4") {
+		t.Fatalf("safe output path = %q, %v", path, err)
+	}
+	if _, err := safeComfyOutputPath(root, "../../outside", "result.mp4"); err == nil {
+		t.Fatal("traversal output path should be rejected")
+	}
+}
+
+func TestComfyUIBatchRejectsInvalidWorkflow(t *testing.T) {
+	cacheDir := t.TempDir()
+	workflowDir := filepath.Join(cacheDir, "staging", "invalid-workflow", "workflows")
+	if err := os.MkdirAll(workflowDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workflowDir, "workflow.json"), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &comfyUIBatchRuntime{cacheDir: cacheDir}
+	_, err := runtime.Run(context.Background(), types.JobAssignment{
+		JobID: "invalid-workflow", Parameters: map[string]interface{}{"runtime": "comfyui-batch"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("invalid workflow error = %v", err)
+	}
+}
+
 func TestDockerImageResolution(t *testing.T) {
 	cases := []struct {
 		name    string

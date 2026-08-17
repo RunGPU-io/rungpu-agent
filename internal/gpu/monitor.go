@@ -5,10 +5,12 @@
 package gpu
 
 import (
+	"context"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
@@ -36,9 +38,9 @@ func Detect() []types.GPUInfo {
 
 // detectNvidia parses `nvidia-smi`. Returns nil if nvidia-smi is unavailable.
 func detectNvidia() []types.GPUInfo {
-	out, err := exec.Command("nvidia-smi",
+	out, err := commandOutput("nvidia-smi",
 		"--query-gpu=index,name,memory.total,driver_version",
-		"--format=csv,noheader,nounits").Output()
+		"--format=csv,noheader,nounits")
 	if err != nil {
 		return nil
 	}
@@ -141,7 +143,7 @@ func sysctl(key string) string {
 
 // Monitor exposes live GPU metrics.
 type Monitor struct {
-	gpus     []types.GPUInfo
+	gpus      []types.GPUInfo
 	hasNvidia bool
 }
 
@@ -189,9 +191,9 @@ func (m *Monitor) CollectMetrics() []types.GPUMetrics {
 }
 
 func collectNvidiaMetrics() []types.GPUMetrics {
-	out, err := exec.Command("nvidia-smi",
+	out, err := commandOutput("nvidia-smi",
 		"--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
-		"--format=csv,noheader,nounits").Output()
+		"--format=csv,noheader,nounits")
 	if err != nil {
 		return nil
 	}
@@ -253,7 +255,7 @@ type SystemInfo struct {
 // DetectSystem returns CPU, RAM, and OS info for the host.
 func DetectSystem() SystemInfo {
 	info := SystemInfo{
-		OSInfo: runtime.GOOS + "/" + runtime.GOARCH,
+		OSInfo:   runtime.GOOS + "/" + runtime.GOARCH,
 		CPUCores: runtime.NumCPU(),
 	}
 
@@ -365,7 +367,7 @@ func parseVMStatValue(line string) uint64 {
 // OllamaModels returns the list of models currently pulled in Ollama.
 // Returns nil if Ollama is not installed or not running.
 func OllamaModels() []string {
-	out, err := exec.Command("ollama", "list").Output()
+	out, err := commandOutput("ollama", "list")
 	if err != nil {
 		return nil
 	}
@@ -385,13 +387,25 @@ func OllamaModels() []string {
 // RuntimeCapabilities returns what job types this host can serve.
 func RuntimeCapabilities() []string {
 	var caps []string
-	if exec.Command("ollama", "--version").Run() == nil {
+	if commandRuns("ollama", "--version") {
 		caps = append(caps, "ollama")
 	}
-	if exec.Command("docker", "version").Run() == nil {
+	if commandRuns("docker", "version") {
 		caps = append(caps, "docker", "workspace")
 	}
 	return caps
+}
+
+func commandOutput(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Output()
+}
+
+func commandRuns(name string, args ...string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run() == nil
 }
 
 // splitCSV splits a comma-separated nvidia-smi line and trims each field.
