@@ -239,6 +239,36 @@ func TestComfyUIBatchRejectsInvalidWorkflow(t *testing.T) {
 	}
 }
 
+func TestComfyUIBatchMountsStagedPresetModels(t *testing.T) {
+	stagingDir := t.TempDir()
+	modelsDir := filepath.Join(stagingDir, "models")
+	if err := os.MkdirAll(filepath.Join(modelsDir, "checkpoints"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mounts, volumes, err := comfyUIBatchStorage(stagingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 1 || mounts[0] != modelsDir+":/opt/ComfyUI/models:ro" {
+		t.Fatalf("model mounts = %v", mounts)
+	}
+	for _, volume := range volumes {
+		if strings.HasSuffix(volume, ":/opt/ComfyUI/models") {
+			t.Fatalf("persistent model volume must be replaced for a complete preset: %v", volumes)
+		}
+	}
+}
+
+func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
+	_, volumes, err := comfyUIBatchStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(volumes) != len(comfyUIBatchVolumes) {
+		t.Fatalf("default volumes = %v", volumes)
+	}
+}
+
 func TestDockerImageResolution(t *testing.T) {
 	cases := []struct {
 		name    string

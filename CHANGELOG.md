@@ -5,6 +5,12 @@ security details are intentionally excluded.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-08-17
+
+- Added support for pool-managed ComfyUI model assets. Verified staged models
+	are mounted read-only for the assigned job while existing model storage
+	remains available for jobs without staged assets.
+
 ## [1.3.0] - 2026-08-16
 
 - Hardened assignment validation and generated-file handling.

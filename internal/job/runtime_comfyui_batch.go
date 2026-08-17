@@ -90,12 +90,16 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	}
 	containerName := CustomContainerName(a.JobID)
 	stagingDir := filepath.Join(r.cacheDir, "staging", a.JobID)
+	mounts, volumes, err := comfyUIBatchStorage(stagingDir)
+	if err != nil {
+		return nil, err
+	}
+	mounts = append(mounts, stagingDir+":/custom:ro", outputDir+":/opt/ComfyUI/output")
 	if _, err := r.docker.Run(ctx, dockermgr.RunOptions{
 		Image: comfyUIBatchImage, Name: containerName,
 		UseGPU: r.useGPU, GPUDevice: r.gpuDevice,
 		Network: "none",
-		Mounts:  []string{stagingDir + ":/custom:ro", outputDir + ":/opt/ComfyUI/output"},
-		Volumes: comfyUIBatchVolumes, ShmSize: "8g",
+		Mounts: mounts, Volumes: volumes, ShmSize: "8g",
 	}); err != nil {
 		return nil, fmt.Errorf("start internal ComfyUI runtime: %w", err)
 	}
@@ -138,6 +142,27 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 }
 
 func (r *comfyUIBatchRuntime) Cleanup(force bool) error { return nil }
+
+func comfyUIBatchStorage(stagingDir string) ([]string, []string, error) {
+	modelsDir := filepath.Join(stagingDir, "models")
+	info, err := os.Stat(modelsDir)
+	if os.IsNotExist(err) {
+		return nil, append([]string(nil), comfyUIBatchVolumes...), nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect staged ComfyUI models: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, nil, fmt.Errorf("staged ComfyUI models path is not a directory")
+	}
+	volumes := make([]string, 0, len(comfyUIBatchVolumes)-1)
+	for _, volume := range comfyUIBatchVolumes {
+		if !strings.HasSuffix(volume, ":/opt/ComfyUI/models") {
+			volumes = append(volumes, volume)
+		}
+	}
+	return []string{modelsDir + ":/opt/ComfyUI/models:ro"}, volumes, nil
+}
 
 func (r *comfyUIBatchRuntime) workflowPath(a types.JobAssignment) (string, error) {
 	if a.Parameters == nil || a.Parameters["runtime"] != "comfyui-batch" {
