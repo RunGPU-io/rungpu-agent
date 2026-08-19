@@ -20,10 +20,11 @@ List your GPU, earn money when others rent it. Source available so you can audit
 ./rungpu-agent start
 ```
 
-`version` must match the release tag shown on GitHub. `setup` installs runtime
-requirements; it does not rebuild or update the agent binary. To upgrade,
-download and extract the newer GitHub release, then run its `setup` and `start`
-commands with the existing `~/.tokenize` enrollment configuration.
+`version` must match the tag shown on
+[GitHub Releases](https://github.com/RunGPU-io/rungpu-agent/releases). `setup`
+installs runtime requirements; it does not rebuild or update the agent binary.
+To upgrade, download and extract the newer GitHub release, then run its `setup`
+and `start` commands with the existing `~/.tokenize` enrollment configuration.
 
 That's it. Your GPU is now earning money.
 
