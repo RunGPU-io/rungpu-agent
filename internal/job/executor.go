@@ -129,10 +129,18 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	}()
 	ctx = jobCtx
 
-	// ── Stage 1: Download verified custom files ────────────────────────
+	// ── Stage 1: Stage the pool-owned workflow and download model assets ─
+	stagingDir := e.cacheDir + "/staging/" + a.JobID
+	if a.WorkflowJSON != "" {
+		if err := StageInlineWorkflow(a.WorkflowJSON, a.WorkflowSHA256, stagingDir); err != nil {
+			res.Success = false
+			res.Error = "inline workflow staging failed: " + err.Error()
+			res.DurationMS = elapsedMilliseconds(start)
+			return res
+		}
+	}
 	if len(a.CustomFiles) > 0 {
 		e.progress(a.JobID, "downloading_files", 0, "Downloading custom files...")
-		stagingDir := e.cacheDir + "/staging/" + a.JobID
 		if err := DownloadCustomFilesCached(ctx, a.CustomFiles, stagingDir, e.cacheDir+"/assets", func(stage string, pct float64, msg string) {
 			e.progress(a.JobID, stage, pct, msg)
 		}); err != nil {

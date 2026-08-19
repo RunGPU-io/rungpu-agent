@@ -269,6 +269,130 @@ func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
 	}
 }
 
+func TestSDXLBasePresetWorkflow(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "presets", "sdxl-base", "workflow.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow map[string]interface{}
+	if err := json.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"1", "2", "3", "4", "5", "6", "7"} {
+		if _, ok := workflow[nodeID].(map[string]interface{}); !ok {
+			t.Fatalf("workflow node %s is missing", nodeID)
+		}
+	}
+	loader := workflow["1"].(map[string]interface{})["inputs"].(map[string]interface{})
+	if loader["ckpt_name"] != "sd_xl_base_1.0.safetensors" {
+		t.Fatalf("checkpoint = %v", loader["ckpt_name"])
+	}
+	if !injectComfyPrompt(workflow, "a mountain observatory at sunrise") {
+		t.Fatal("preset workflow did not accept the renter prompt")
+	}
+	positive := workflow["2"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	negative := workflow["3"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	if positive != "a mountain observatory at sunrise" || negative != "blurry, low quality, distorted, watermark, text" {
+		t.Fatalf("unexpected prompts: positive=%q negative=%q", positive, negative)
+	}
+}
+
+func TestWan21PresetWorkflow(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "presets", "wan-2.1-1.3b", "workflow.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow map[string]interface{}
+	if err := json.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for nodeID, classType := range map[string]string{
+		"3": "KSampler", "6": "CLIPTextEncode", "7": "CLIPTextEncode", "8": "VAEDecode",
+		"37": "UNETLoader", "38": "CLIPLoader", "39": "VAELoader", "40": "EmptyHunyuanLatentVideo",
+		"48": "ModelSamplingSD3", "49": "CreateVideo", "50": "SaveVideo",
+	} {
+		node, ok := workflow[nodeID].(map[string]interface{})
+		if !ok || node["class_type"] != classType {
+			t.Fatalf("workflow node %s class = %v, want %s", nodeID, node["class_type"], classType)
+		}
+	}
+	if workflow["37"].(map[string]interface{})["inputs"].(map[string]interface{})["unet_name"] != "wan2.1_t2v_1.3B_fp16.safetensors" {
+		t.Fatal("Wan UNet filename does not match the staged asset")
+	}
+	if workflow["38"].(map[string]interface{})["inputs"].(map[string]interface{})["clip_name"] != "umt5_xxl_fp8_e4m3fn_scaled.safetensors" {
+		t.Fatal("Wan text encoder filename does not match the staged asset")
+	}
+	if workflow["39"].(map[string]interface{})["inputs"].(map[string]interface{})["vae_name"] != "wan_2.1_vae.safetensors" {
+		t.Fatal("Wan VAE filename does not match the staged asset")
+	}
+	assertComfyLink(t, workflow, "3", "model", "48", 0)
+	assertComfyLink(t, workflow, "8", "vae", "39", 0)
+	assertComfyLink(t, workflow, "50", "video", "49", 0)
+	if !injectComfyPrompt(workflow, "a paper boat crossing a rain puddle") {
+		t.Fatal("Wan workflow did not accept the renter prompt")
+	}
+	positive := workflow["6"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	negative := workflow["7"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	if positive != "a paper boat crossing a rain puddle" || !strings.Contains(negative.(string), "low quality") {
+		t.Fatalf("unexpected Wan prompts: positive=%q negative=%q", positive, negative)
+	}
+}
+
+func TestLTXVideo09PresetWorkflow(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "presets", "ltx-video-0.9", "workflow.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow map[string]interface{}
+	if err := json.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for nodeID, classType := range map[string]string{
+		"6": "CLIPTextEncode", "7": "CLIPTextEncode", "8": "VAEDecode", "38": "CLIPLoader",
+		"44": "CheckpointLoaderSimple", "69": "LTXVConditioning", "70": "EmptyLTXVLatentVideo",
+		"71": "LTXVScheduler", "72": "SamplerCustom", "73": "KSamplerSelect", "78": "CreateVideo", "79": "SaveVideo",
+	} {
+		node, ok := workflow[nodeID].(map[string]interface{})
+		if !ok || node["class_type"] != classType {
+			t.Fatalf("workflow node %s class = %v, want %s", nodeID, node["class_type"], classType)
+		}
+	}
+	if workflow["44"].(map[string]interface{})["inputs"].(map[string]interface{})["ckpt_name"] != "ltx-video-2b-v0.9.safetensors" {
+		t.Fatal("LTX checkpoint filename does not match the staged asset")
+	}
+	if workflow["38"].(map[string]interface{})["inputs"].(map[string]interface{})["clip_name"] != "t5xxl_fp16.safetensors" {
+		t.Fatal("LTX text encoder filename does not match the staged asset")
+	}
+	assertComfyLink(t, workflow, "72", "positive", "69", 0)
+	assertComfyLink(t, workflow, "72", "sigmas", "71", 0)
+	assertComfyLink(t, workflow, "8", "vae", "44", 2)
+	assertComfyLink(t, workflow, "79", "video", "78", 0)
+	if !injectComfyPrompt(workflow, "a long tracking shot through a glass greenhouse") {
+		t.Fatal("LTX workflow did not accept the renter prompt")
+	}
+	positive := workflow["6"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	negative := workflow["7"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
+	if positive != "a long tracking shot through a glass greenhouse" || !strings.Contains(negative.(string), "motion artifacts") {
+		t.Fatalf("unexpected LTX prompts: positive=%q negative=%q", positive, negative)
+	}
+}
+
+func assertComfyLink(t *testing.T, workflow map[string]interface{}, nodeID, inputName, sourceID string, outputIndex float64) {
+	t.Helper()
+	node, ok := workflow[nodeID].(map[string]interface{})
+	if !ok {
+		t.Fatalf("workflow node %s is missing", nodeID)
+	}
+	inputs, ok := node["inputs"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("workflow node %s inputs are missing", nodeID)
+	}
+	link, ok := inputs[inputName].([]interface{})
+	if !ok || len(link) != 2 || link[0] != sourceID || link[1] != outputIndex {
+		t.Fatalf("workflow node %s input %s link = %v, want [%s %v]", nodeID, inputName, inputs[inputName], sourceID, outputIndex)
+	}
+}
+
 func TestDockerImageResolution(t *testing.T) {
 	cases := []struct {
 		name    string

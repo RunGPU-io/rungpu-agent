@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +69,25 @@ func hfToken() string {
 // ProgressFunc is called at each pipeline stage so the caller can relay
 // progress to the WebSocket (and thus to the user's browser).
 type ProgressFunc func(stage string, progress float64, message string)
+
+func StageInlineWorkflow(workflow, expectedSHA256, stagingDir string) error {
+	data := []byte(workflow)
+	if len(data) == 0 || len(data) > 256*1024 || !json.Valid(data) {
+		return fmt.Errorf("workflow must be valid JSON no larger than 256 KiB")
+	}
+	actual := sha256.Sum256(data)
+	if hex.EncodeToString(actual[:]) != expectedSHA256 {
+		return fmt.Errorf("workflow SHA-256 mismatch")
+	}
+	workflowDir := filepath.Join(stagingDir, "workflows")
+	if err := os.MkdirAll(workflowDir, 0o700); err != nil {
+		return fmt.Errorf("create workflow directory: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(workflowDir, "workflow.json"), data, 0o600); err != nil {
+		return fmt.Errorf("write workflow: %w", err)
+	}
+	return nil
+}
 
 // ResolveImage determines the explicit Docker batch worker to use for a job.
 func ResolveImage(a types.JobAssignment) (string, error) {

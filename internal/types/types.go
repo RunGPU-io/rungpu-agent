@@ -3,11 +3,13 @@
 package types
 
 import (
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 )
 
-const JobProtocolVersion = 2
+const JobProtocolVersion = 3
 
 var safeJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
@@ -111,7 +113,9 @@ type JobAssignment struct {
 	// Each entry is a URL to download → mount path inside the container.
 	// Used for safetensors, ComfyUI workflows, and reference inputs.
 	//   e.g. [{"url": "https://civitai.com/api/download/models/123", "path": "/models/loras/my.safetensors"}]
-	CustomFiles []CustomFile `json:"custom_files,omitempty"`
+	CustomFiles    []CustomFile `json:"custom_files,omitempty"`
+	WorkflowJSON   string       `json:"workflow_json,omitempty"`
+	WorkflowSHA256 string       `json:"workflow_sha256,omitempty"`
 
 	// ── Output upload ───────────────────────────────────────────────────
 	// Where the agent should upload generated files (images, videos).
@@ -142,6 +146,19 @@ func (a JobAssignment) Validate() error {
 		for _, file := range a.CustomFiles {
 			if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(file.SHA256) {
 				return fmt.Errorf("custom file sha256 is required by job protocol version %d", a.ProtocolVersion)
+			}
+		}
+		if a.WorkflowJSON != "" {
+			if len(a.WorkflowJSON) > 256*1024 || !json.Valid([]byte(a.WorkflowJSON)) {
+				return fmt.Errorf("workflow_json must be valid JSON no larger than 256 KiB")
+			}
+			if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(a.WorkflowSHA256) {
+				return fmt.Errorf("workflow_sha256 is required for inline workflows")
+			}
+			for _, file := range a.CustomFiles {
+				if filepath.Clean(file.Path) == "workflows/workflow.json" {
+					return fmt.Errorf("custom files cannot override the inline workflow")
+				}
 			}
 		}
 	}

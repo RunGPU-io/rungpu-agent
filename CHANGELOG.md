@@ -3,27 +3,18 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
-## [Unreleased]
+## [1.3.2] - 2026-08-18
+
+- Added support for new image and video generation workloads.
 
 ## [1.3.1] - 2026-08-17
 
-- Added support for pool-managed ComfyUI model assets. Verified staged models
-	are mounted read-only for the assigned job while existing model storage
-	remains available for jobs without staged assets.
+- Expanded support for managed AI generation workloads.
 
 ## [1.3.0] - 2026-08-16
 
-- Hardened assignment validation and generated-file handling.
-- Restricted managed downloads, redirects, and result uploads to approved
-	HTTPS destinations.
-- Isolated batch inference containers from outbound networks while preserving
-	explicit workspace networking.
-- Added SHA-256 verification and content-addressed caching for custom assets,
-	and rejected model formats capable of unsafe deserialization.
-- Removed runtime-triggered software installation. Runtime requirements are
-	now installed only through the explicit `setup` command.
-- Added compatibility checks for versioned coordinator job messages and
-	provenance attestations for release artifacts.
+- Improved workload security, reliability, and compatibility.
+- Improved setup and asset handling.
 
 ## [1.2.1] - 2026-08-16
 
