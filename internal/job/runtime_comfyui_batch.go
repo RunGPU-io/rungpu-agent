@@ -110,7 +110,7 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	}()
 
 	requestContainerPath := "/custom/workflows/rungpu-request.json"
-	cmd := exec.CommandContext(ctx, "docker", "exec", containerName, "python3", "-c", comfyUIRunnerScript, requestContainerPath)
+	cmd := exec.CommandContext(ctx, "docker", "exec", containerName, "python3", "-c", comfyUIRunner(), requestContainerPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
@@ -287,12 +287,12 @@ with open(request_path, "rb") as handle:
     payload = handle.read()
 request = urllib.request.Request(base + "/prompt", data=payload, headers={"Content-Type": "application/json"})
 try:
-	queued = read_json(request, 30)
+    queued = read_json(request, 30)
 except urllib.error.HTTPError as error:
-	detail = error.read().decode("utf-8", "replace").strip()
-	raise SystemExit("workflow rejected: HTTP " + str(error.code) + (": " + detail[-4000:] if detail else ""))
+    detail = error.read().decode("utf-8", "replace").strip()
+    raise SystemExit("workflow rejected: HTTP " + str(error.code) + (": " + detail[-4000:] if detail else ""))
 except Exception as error:
-	raise SystemExit("workflow submission failed: " + type(error).__name__ + ": " + str(error))
+    raise SystemExit("workflow submission failed: " + type(error).__name__ + ": " + str(error))
 prompt_id = queued.get("prompt_id")
 if not prompt_id:
     raise SystemExit("workflow rejected: " + json.dumps(queued))
@@ -314,3 +314,7 @@ for _ in range(3600):
     time.sleep(1)
 raise SystemExit("workflow timed out")
 `
+
+func comfyUIRunner() string {
+	return strings.ReplaceAll(comfyUIRunnerScript, "\t", "    ")
+}

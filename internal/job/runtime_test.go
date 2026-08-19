@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -188,6 +189,13 @@ func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
 }
 
 func TestComfyUIRunnerRequiresCompleteAPIReadinessAndReportsEmptySubmission(t *testing.T) {
+	runner := comfyUIRunner()
+	if strings.ContainsRune(runner, '\t') {
+		t.Fatal("ComfyUI runner contains tab indentation")
+	}
+	if output, err := exec.Command("python3", "-c", "compile(__import__('sys').argv[1], '<comfyui-runner>', 'exec')", runner).CombinedOutput(); err != nil {
+		t.Fatalf("ComfyUI runner is not valid Python: %s", output)
+	}
 	for _, required := range []string{
 		`read_json(base + "/system_stats", 2)`,
 		`read_json(base + "/object_info", 10)`,
@@ -195,7 +203,7 @@ func TestComfyUIRunnerRequiresCompleteAPIReadinessAndReportsEmptySubmission(t *t
 		`workflow submission failed: `,
 		`workflow rejected: HTTP `,
 	} {
-		if !strings.Contains(comfyUIRunnerScript, required) {
+		if !strings.Contains(runner, required) {
 			t.Fatalf("ComfyUI runner is missing %q", required)
 		}
 	}

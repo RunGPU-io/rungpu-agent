@@ -3,6 +3,11 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.7] - 2026-08-19
+
+- Fix mixed indentation in the embedded ComfyUI runner introduced in v1.3.6.
+- Compile-check the exact normalized runner during tests to prevent recurrence.
+
 ## [1.3.6] - 2026-08-19
 
 - Wait for the complete ComfyUI API to become ready before submitting managed
