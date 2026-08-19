@@ -187,6 +187,20 @@ func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
 	}
 }
 
+func TestComfyUIRunnerRequiresCompleteAPIReadinessAndReportsEmptySubmission(t *testing.T) {
+	for _, required := range []string{
+		`read_json(base + "/system_stats", 2)`,
+		`read_json(base + "/object_info", 10)`,
+		`raise ValueError("empty response")`,
+		`workflow submission failed: `,
+		`workflow rejected: HTTP `,
+	} {
+		if !strings.Contains(comfyUIRunnerScript, required) {
+			t.Fatalf("ComfyUI runner is missing %q", required)
+		}
+	}
+}
+
 func TestDockerImageResolution(t *testing.T) {
 	cases := []struct {
 		name    string

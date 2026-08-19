@@ -3,6 +3,13 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.6] - 2026-08-19
+
+- Wait for the complete ComfyUI API to become ready before submitting managed
+	workflows.
+- Report HTTP, empty-response, invalid-response, and container-exit failures
+	separately instead of showing a generic JSON parsing error.
+
 ## [1.3.5] - 2026-08-19
 
 - Fixed model preparation on Windows when the verified model cache does not

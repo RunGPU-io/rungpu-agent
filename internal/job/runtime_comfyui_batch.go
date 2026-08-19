@@ -117,6 +117,9 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		if message == "" {
 			message = err.Error()
 		}
+		if running, exitCode, inspectErr := r.docker.Inspect(context.Background(), containerName); inspectErr == nil && !running {
+			message = fmt.Sprintf("%s (ComfyUI container exited with code %d)", message, exitCode)
+		}
 		return nil, fmt.Errorf("ComfyUI workflow failed: %s", message)
 	}
 
@@ -258,12 +261,23 @@ func validateOutputFile(root, candidate string) (string, error) {
 }
 
 const comfyUIRunnerScript = `
-import json, sys, time, urllib.request
+import json, sys, time, urllib.error, urllib.request
 request_path = sys.argv[1]
 base = "http://127.0.0.1:8188"
+
+def read_json(url, timeout):
+	with urllib.request.urlopen(url, timeout=timeout) as response:
+		body = response.read()
+		if not body.strip():
+			raise ValueError("empty response")
+		return json.loads(body)
+
 for _ in range(180):
     try:
-        urllib.request.urlopen(base + "/system_stats", timeout=2).read()
+		read_json(base + "/system_stats", 2)
+		object_info = read_json(base + "/object_info", 10)
+		if not isinstance(object_info, dict) or not object_info:
+			raise ValueError("empty object registry")
         break
     except Exception:
         time.sleep(1)
@@ -273,14 +287,17 @@ with open(request_path, "rb") as handle:
     payload = handle.read()
 request = urllib.request.Request(base + "/prompt", data=payload, headers={"Content-Type": "application/json"})
 try:
-    queued = json.loads(urllib.request.urlopen(request, timeout=30).read())
+	queued = read_json(request, 30)
+except urllib.error.HTTPError as error:
+	detail = error.read().decode("utf-8", "replace").strip()
+	raise SystemExit("workflow rejected: HTTP " + str(error.code) + (": " + detail[-4000:] if detail else ""))
 except Exception as error:
-    raise SystemExit("workflow rejected: " + str(error))
+	raise SystemExit("workflow submission failed: " + type(error).__name__ + ": " + str(error))
 prompt_id = queued.get("prompt_id")
 if not prompt_id:
     raise SystemExit("workflow rejected: " + json.dumps(queued))
 for _ in range(3600):
-    history = json.loads(urllib.request.urlopen(base + "/history/" + prompt_id, timeout=10).read())
+	history = read_json(base + "/history/" + prompt_id, 10)
     item = history.get(prompt_id)
     if item:
         status = item.get("status", {})
