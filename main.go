@@ -35,6 +35,13 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/pool"
 )
 
+// version is injected by the GitHub release workflow with:
+//
+//	-ldflags "-X main.version=${GITHUB_REF_NAME}"
+//
+// Keep "dev" for local source builds.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -56,6 +63,9 @@ func main() {
 		err = cmdStatus(args)
 	case "cleanup":
 		err = cmdCleanup(args)
+	case "version", "--version", "-v":
+		fmt.Println(version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -80,6 +90,7 @@ Commands:
   start    Connect to the pool and serve jobs
 	status   Check enrollment, runtime readiness, GPUs, and live metrics
   cleanup  Remove containers, volumes, images, caches, config, and services
+  version  Print the GitHub release version of this binary
 
 Run "tokenize-gpu-agent <command> -h" for command flags.`)
 }
@@ -275,6 +286,7 @@ func setupCommand(goos, executable string) string {
 func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	_ = fs.Parse(args)
+	fmt.Printf("RunGPU Agent %s setup\n", version)
 
 	commands, err := setupCommands(runtime.GOOS)
 	if err != nil {
@@ -393,7 +405,13 @@ func cmdStart(args []string) error {
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 
-	fmt.Println("RunGPU Agent starting...")
+	releaseLock, err := acquireAgentProcessLock()
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
+	fmt.Printf("RunGPU Agent %s starting...\n", version)
 	fmt.Printf("Loading configuration: %s\n", *cfgPath)
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -406,6 +424,26 @@ func cmdStart(args []string) error {
 	if !hadMachineID {
 		if err := config.Save(cfg, *cfgPath); err != nil {
 			return fmt.Errorf("persist machine identity: %w", err)
+		}
+	}
+
+	// Containers normally disappear when jobs finish or the agent shuts down.
+	// A host crash/SIGKILL can bypass those defers and leave an agent-owned
+	// workspace holding loopback port 8188 (or another requested port). Reconcile
+	// only tokenize-* containers before accepting new work. `setup` deliberately
+	// does not do this because installing prerequisites must not stop workloads.
+	dockerProbeCtx, cancelDockerProbe := context.WithTimeout(context.Background(), 10*time.Second)
+	dockerAvailable := exec.CommandContext(dockerProbeCtx, "docker", "version").Run() == nil
+	cancelDockerProbe()
+	if dockerAvailable {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
+		removed, cleanupErr := dockermgr.New().RemoveAllTokenizeContainers(cleanupCtx)
+		cancelCleanup()
+		if cleanupErr != nil {
+			return fmt.Errorf("remove stale agent runtime containers before start: %w", cleanupErr)
+		}
+		if removed > 0 {
+			fmt.Printf("Removed %d stale agent container(s); released their ports and GPU resources.\n", removed)
 		}
 	}
 
@@ -452,6 +490,7 @@ func cmdStatus(args []string) error {
 	_ = fs.Parse(args)
 
 	fmt.Println("\n=== RunGPU Agent Status ===")
+	fmt.Printf("Version: %s\n", version)
 	fmt.Println("Checking GPU and runtime capabilities...")
 	monitor := gpu.NewMonitor()
 	gpus := monitor.GPUs()

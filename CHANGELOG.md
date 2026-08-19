@@ -3,6 +3,11 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.8] - 2026-08-19
+
+- Improved agent startup and managed workload reliability.
+- Added release version reporting to simplify support and troubleshooting.
+
 ## [1.3.7] - 2026-08-19
 
 - Fix mixed indentation in the embedded ComfyUI runner introduced in v1.3.6.

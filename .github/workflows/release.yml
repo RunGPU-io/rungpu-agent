@@ -130,6 +130,9 @@ jobs:
             # Install supported runtime requirements
             ./rungpu-agent-darwin-arm64 setup
 
+            # Confirm the binary matches this GitHub release tag
+            ./rungpu-agent-darwin-arm64 version
+
             # Start earning
             ./rungpu-agent-darwin-arm64 start
             ```

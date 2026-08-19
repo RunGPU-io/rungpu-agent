@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
@@ -101,6 +102,13 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		UseGPU: r.useGPU, GPUDevice: r.gpuDevice,
 		Network: "none",
 		Mounts:  mounts, Volumes: volumes, ShmSize: "8g",
+		// ai-dock documents these settings in its docker-compose example, but
+		// they are not baked into the image config. In particular, WAN address
+		// discovery and quick tunnels cannot succeed under Network=none and may
+		// delay or prevent the supervised ComfyUI service from becoming ready.
+		// Batch inference needs only the container-local API, so keep it bound
+		// to loopback and disable every network-dependent startup feature.
+		Env: comfyUIBatchEnv(),
 	}); err != nil {
 		return nil, fmt.Errorf("start internal ComfyUI runtime: %w", err)
 	}
@@ -119,6 +127,10 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		}
 		if running, exitCode, inspectErr := r.docker.Inspect(context.Background(), containerName); inspectErr == nil && !running {
 			message = fmt.Sprintf("%s (ComfyUI container exited with code %d)", message, exitCode)
+		}
+		diagnostics := r.comfyUIDiagnostics(containerName)
+		if diagnostics != "" {
+			message += "\n" + diagnostics
 		}
 		return nil, fmt.Errorf("ComfyUI workflow failed: %s", message)
 	}
@@ -146,6 +158,42 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 }
 
 func (r *comfyUIBatchRuntime) Cleanup(force bool) error { return nil }
+
+func comfyUIBatchEnv() map[string]string {
+	return map[string]string{
+		"AUTO_UPDATE":            "false",
+		"DIRECT_ADDRESS":         "127.0.0.1",
+		"DIRECT_ADDRESS_GET_WAN": "false",
+		"WORKSPACE":              "/workspace",
+		"WORKSPACE_SYNC":         "false",
+		"CF_QUICK_TUNNELS":       "false",
+		"WEB_ENABLE_AUTH":        "false",
+		"WEB_ENABLE_HTTPS":       "false",
+		"COMFYUI_ARGS":           "--listen 127.0.0.1 --port 8188",
+		"COMFYUI_PORT_HOST":      "8188",
+		"SERVERLESS":             "false",
+	}
+}
+
+// comfyUIDiagnostics captures service state and recent logs before the deferred
+// cleanup removes the failed container. This is intentionally best-effort:
+// diagnostics must never replace the original workflow error.
+func (r *comfyUIBatchRuntime) comfyUIDiagnostics(containerName string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	parts := make([]string, 0, 2)
+	if output, err := exec.CommandContext(
+		ctx, "docker", "exec", containerName,
+		"supervisorctl", "status", "comfyui",
+	).CombinedOutput(); err == nil || len(output) > 0 {
+		parts = append(parts, "ComfyUI service status:\n"+strings.TrimSpace(string(output)))
+	}
+	if logs, err := r.docker.Logs(ctx, containerName, 200); err == nil && strings.TrimSpace(logs) != "" {
+		parts = append(parts, "Recent container logs:\n"+strings.TrimSpace(logs))
+	}
+	return strings.Join(parts, "\n")
+}
 
 func comfyUIBatchStorage(stagingDir string) ([]string, []string, error) {
 	modelsDir := filepath.Join(stagingDir, "models")
@@ -264,6 +312,7 @@ const comfyUIRunnerScript = `
 import json, sys, time, urllib.error, urllib.request
 request_path = sys.argv[1]
 base = "http://127.0.0.1:8188"
+last_error = "no readiness attempt completed"
 
 def read_json(url, timeout):
 	with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -272,17 +321,18 @@ def read_json(url, timeout):
 			raise ValueError("empty response")
 		return json.loads(body)
 
-for _ in range(180):
+for _ in range(300):
     try:
 		read_json(base + "/system_stats", 2)
 		object_info = read_json(base + "/object_info", 10)
 		if not isinstance(object_info, dict) or not object_info:
 			raise ValueError("empty object registry")
         break
-    except Exception:
+    except Exception as error:
+		last_error = type(error).__name__ + ": " + str(error)
         time.sleep(1)
 else:
-    raise SystemExit("ComfyUI did not become ready")
+    raise SystemExit("ComfyUI did not become ready after 300 seconds; last probe: " + last_error)
 with open(request_path, "rb") as handle:
     payload = handle.read()
 request = urllib.request.Request(base + "/prompt", data=payload, headers={"Content-Type": "application/json"})

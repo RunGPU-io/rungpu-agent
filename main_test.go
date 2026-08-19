@@ -1,6 +1,15 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestVersionHasBuildFallback(t *testing.T) {
+	if strings.TrimSpace(version) == "" {
+		t.Fatal("version must have a non-empty fallback for local builds")
+	}
+}
 
 func TestStartCommand(t *testing.T) {
 	tests := []struct {

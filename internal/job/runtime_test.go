@@ -200,11 +200,34 @@ func TestComfyUIRunnerRequiresCompleteAPIReadinessAndReportsEmptySubmission(t *t
 		`read_json(base + "/system_stats", 2)`,
 		`read_json(base + "/object_info", 10)`,
 		`raise ValueError("empty response")`,
+		`last_error = type(error).__name__ + ": " + str(error)`,
+		`did not become ready after 300 seconds; last probe: `,
 		`workflow submission failed: `,
 		`workflow rejected: HTTP `,
 	} {
 		if !strings.Contains(runner, required) {
 			t.Fatalf("ComfyUI runner is missing %q", required)
+		}
+	}
+}
+
+func TestComfyUIBatchEnvironmentIsOfflineAndDeterministic(t *testing.T) {
+	env := comfyUIBatchEnv()
+	required := map[string]string{
+		"AUTO_UPDATE":            "false",
+		"DIRECT_ADDRESS":         "127.0.0.1",
+		"DIRECT_ADDRESS_GET_WAN": "false",
+		"WORKSPACE_SYNC":         "false",
+		"CF_QUICK_TUNNELS":       "false",
+		"WEB_ENABLE_AUTH":        "false",
+		"WEB_ENABLE_HTTPS":       "false",
+		"COMFYUI_ARGS":           "--listen 127.0.0.1 --port 8188",
+		"COMFYUI_PORT_HOST":      "8188",
+		"SERVERLESS":             "false",
+	}
+	for key, want := range required {
+		if got := env[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
 }

@@ -16,8 +16,14 @@ List your GPU, earn money when others rent it. Source available so you can audit
 ```bash
 ./rungpu-agent init --enrollment-token YOUR_ONE_TIME_TOKEN
 ./rungpu-agent setup
+./rungpu-agent version
 ./rungpu-agent start
 ```
+
+`version` must match the release tag shown on GitHub. `setup` installs runtime
+requirements; it does not rebuild or update the agent binary. To upgrade,
+download and extract the newer GitHub release, then run its `setup` and `start`
+commands with the existing `~/.tokenize` enrollment configuration.
 
 That's it. Your GPU is now earning money.
 
@@ -45,6 +51,7 @@ sudo ./scripts/install.sh
 | `rungpu-agent start` | Start earning |
 | `rungpu-agent status` | Check GPU status |
 | `rungpu-agent cleanup` | Remove agent data |
+| `rungpu-agent version` | Print the embedded GitHub release version |
 
 ## Requirements
 
