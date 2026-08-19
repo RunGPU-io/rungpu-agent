@@ -23,9 +23,9 @@ func TestOllamaModel(t *testing.T) {
 		want string
 	}{
 		{"simple", types.JobAssignment{ModelName: "llama2"}, "llama2"},
-		{"path style", types.JobAssignment{ModelName: "meta-llama/Llama-2-7b-hf"}, "llama-2-7b-hf"},
+		{"coordinator tag", types.JobAssignment{ModelName: "registry/model:tag"}, "registry/model:tag"},
 		{"explicit param", types.JobAssignment{ModelName: "x", Parameters: map[string]interface{}{"ollama_model": "mistral:7b"}}, "mistral:7b"},
-		{"uppercase", types.JobAssignment{ModelName: "GPT4All"}, "gpt4all"},
+		{"preserves case", types.JobAssignment{ModelName: "AssignedTag"}, "AssignedTag"},
 		{"empty param fallback", types.JobAssignment{ModelName: "phi3", Parameters: map[string]interface{}{"ollama_model": ""}}, "phi3"},
 	}
 	for _, tc := range cases {
@@ -71,91 +71,6 @@ func TestNewRuntime(t *testing.T) {
 	}
 }
 
-func TestIsKnownDockerModel(t *testing.T) {
-	docker := []string{"ltx-video", "ltx2", "wan2", "wan2.1", "stable-diffusion", "sdxl", "flux", "flux.1", "whisper"}
-	for _, m := range docker {
-		if !isKnownDockerModel(m) {
-			t.Errorf("%q should be a Docker model", m)
-		}
-	}
-	ollama := []string{"llama2", "mistral", "phi3", "codellama", "gemma"}
-	for _, m := range ollama {
-		if isKnownDockerModel(m) {
-			t.Errorf("%q should NOT be a Docker model", m)
-		}
-	}
-	if !isKnownDockerModel("my-custom-video-gen") {
-		t.Error("model with 'video' should be Docker")
-	}
-}
-
-func TestIsWorkspaceJob(t *testing.T) {
-	// Known workspace names
-	for _, name := range []string{"comfyui", "jupyter", "a1111", "invokeai"} {
-		a := types.JobAssignment{ModelName: name}
-		if !isWorkspaceJob(a) {
-			t.Errorf("%q should be a workspace job", name)
-		}
-	}
-	// Workspace bool field
-	if !isWorkspaceJob(types.JobAssignment{ModelName: "anything", Workspace: true}) {
-		t.Error("Workspace=true field should make it a workspace job")
-	}
-	// Explicit workspace=true param (backward compat)
-	a := types.JobAssignment{
-		ModelName:  "custom-thing",
-		Parameters: map[string]interface{}{"workspace": true},
-	}
-	if !isWorkspaceJob(a) {
-		t.Error("workspace=true param should make it a workspace job")
-	}
-	// Regular LLM is NOT a workspace
-	if isWorkspaceJob(types.JobAssignment{ModelName: "llama2"}) {
-		t.Error("llama2 should not be a workspace job")
-	}
-}
-
-func TestHasExplicitDockerImage(t *testing.T) {
-	// DockerImage field
-	if !hasExplicitDockerImage(types.JobAssignment{DockerImage: "myimg:v1"}) {
-		t.Error("DockerImage field should be detected")
-	}
-	// Parameters docker_image
-	if !hasExplicitDockerImage(types.JobAssignment{Parameters: map[string]interface{}{"docker_image": "img:v2"}}) {
-		t.Error("Parameters docker_image should be detected")
-	}
-	// Neither
-	if hasExplicitDockerImage(types.JobAssignment{ModelName: "llama2"}) {
-		t.Error("llama2 should not have explicit docker image")
-	}
-	// Empty string
-	if hasExplicitDockerImage(types.JobAssignment{DockerImage: ""}) {
-		t.Error("empty DockerImage should not count")
-	}
-}
-
-func TestIsComfyUIBatchJob(t *testing.T) {
-	job := types.JobAssignment{Parameters: map[string]interface{}{"runtime": "comfyui-batch"}}
-	if !isComfyUIBatchJob(job) {
-		t.Fatal("explicit comfyui-batch runtime should be detected")
-	}
-	if isComfyUIBatchJob(types.JobAssignment{}) {
-		t.Fatal("job without an explicit runtime should not use ComfyUI batch")
-	}
-
-	comfy := &comfyUIBatchRuntime{}
-	runtime, err := (&multiRuntime{comfyUIBatch: comfy, dockerCustom: &customDockerRuntime{}}).selectRuntime(types.JobAssignment{
-		ModelName: "stable-diffusion", DockerImage: "renter/image:latest",
-		Parameters: map[string]interface{}{"runtime": "comfyui-batch"},
-	})
-	if err != nil || runtime != comfy {
-		t.Fatalf("ComfyUI batch selection = %T, %v", runtime, err)
-	}
-	if _, err := (&multiRuntime{}).selectRuntime(job); err == nil || !strings.Contains(err.Error(), "require Docker") {
-		t.Fatalf("missing ComfyUI batch runtime error = %v", err)
-	}
-}
-
 func TestExplicitRuntimeSelection(t *testing.T) {
 	ollama := &ollamaRuntime{}
 	docker := &customDockerRuntime{}
@@ -173,6 +88,9 @@ func TestExplicitRuntimeSelection(t *testing.T) {
 	}
 	if _, err := runtimes.selectRuntime(types.JobAssignment{Runtime: "unknown"}); err == nil {
 		t.Fatal("unknown explicit runtime should be rejected")
+	}
+	if _, err := runtimes.selectRuntime(types.JobAssignment{}); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("missing runtime error = %v", err)
 	}
 }
 
@@ -269,130 +187,6 @@ func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
 	}
 }
 
-func TestSDXLBasePresetWorkflow(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "presets", "sdxl-base", "workflow.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var workflow map[string]interface{}
-	if err := json.Unmarshal(data, &workflow); err != nil {
-		t.Fatal(err)
-	}
-	for _, nodeID := range []string{"1", "2", "3", "4", "5", "6", "7"} {
-		if _, ok := workflow[nodeID].(map[string]interface{}); !ok {
-			t.Fatalf("workflow node %s is missing", nodeID)
-		}
-	}
-	loader := workflow["1"].(map[string]interface{})["inputs"].(map[string]interface{})
-	if loader["ckpt_name"] != "sd_xl_base_1.0.safetensors" {
-		t.Fatalf("checkpoint = %v", loader["ckpt_name"])
-	}
-	if !injectComfyPrompt(workflow, "a mountain observatory at sunrise") {
-		t.Fatal("preset workflow did not accept the renter prompt")
-	}
-	positive := workflow["2"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
-	negative := workflow["3"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
-	if positive != "a mountain observatory at sunrise" || negative != "blurry, low quality, distorted, watermark, text" {
-		t.Fatalf("unexpected prompts: positive=%q negative=%q", positive, negative)
-	}
-}
-
-func TestWan21PresetWorkflow(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "presets", "wan-2.1-1.3b", "workflow.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var workflow map[string]interface{}
-	if err := json.Unmarshal(data, &workflow); err != nil {
-		t.Fatal(err)
-	}
-	for nodeID, classType := range map[string]string{
-		"3": "KSampler", "6": "CLIPTextEncode", "7": "CLIPTextEncode", "8": "VAEDecode",
-		"37": "UNETLoader", "38": "CLIPLoader", "39": "VAELoader", "40": "EmptyHunyuanLatentVideo",
-		"48": "ModelSamplingSD3", "49": "CreateVideo", "50": "SaveVideo",
-	} {
-		node, ok := workflow[nodeID].(map[string]interface{})
-		if !ok || node["class_type"] != classType {
-			t.Fatalf("workflow node %s class = %v, want %s", nodeID, node["class_type"], classType)
-		}
-	}
-	if workflow["37"].(map[string]interface{})["inputs"].(map[string]interface{})["unet_name"] != "wan2.1_t2v_1.3B_fp16.safetensors" {
-		t.Fatal("Wan UNet filename does not match the staged asset")
-	}
-	if workflow["38"].(map[string]interface{})["inputs"].(map[string]interface{})["clip_name"] != "umt5_xxl_fp8_e4m3fn_scaled.safetensors" {
-		t.Fatal("Wan text encoder filename does not match the staged asset")
-	}
-	if workflow["39"].(map[string]interface{})["inputs"].(map[string]interface{})["vae_name"] != "wan_2.1_vae.safetensors" {
-		t.Fatal("Wan VAE filename does not match the staged asset")
-	}
-	assertComfyLink(t, workflow, "3", "model", "48", 0)
-	assertComfyLink(t, workflow, "8", "vae", "39", 0)
-	assertComfyLink(t, workflow, "50", "video", "49", 0)
-	if !injectComfyPrompt(workflow, "a paper boat crossing a rain puddle") {
-		t.Fatal("Wan workflow did not accept the renter prompt")
-	}
-	positive := workflow["6"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
-	negative := workflow["7"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
-	if positive != "a paper boat crossing a rain puddle" || !strings.Contains(negative.(string), "low quality") {
-		t.Fatalf("unexpected Wan prompts: positive=%q negative=%q", positive, negative)
-	}
-}
-
-func TestLTXVideo09PresetWorkflow(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "presets", "ltx-video-0.9", "workflow.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var workflow map[string]interface{}
-	if err := json.Unmarshal(data, &workflow); err != nil {
-		t.Fatal(err)
-	}
-	for nodeID, classType := range map[string]string{
-		"6": "CLIPTextEncode", "7": "CLIPTextEncode", "8": "VAEDecode", "38": "CLIPLoader",
-		"44": "CheckpointLoaderSimple", "69": "LTXVConditioning", "70": "EmptyLTXVLatentVideo",
-		"71": "LTXVScheduler", "72": "SamplerCustom", "73": "KSamplerSelect", "78": "CreateVideo", "79": "SaveVideo",
-	} {
-		node, ok := workflow[nodeID].(map[string]interface{})
-		if !ok || node["class_type"] != classType {
-			t.Fatalf("workflow node %s class = %v, want %s", nodeID, node["class_type"], classType)
-		}
-	}
-	if workflow["44"].(map[string]interface{})["inputs"].(map[string]interface{})["ckpt_name"] != "ltx-video-2b-v0.9.safetensors" {
-		t.Fatal("LTX checkpoint filename does not match the staged asset")
-	}
-	if workflow["38"].(map[string]interface{})["inputs"].(map[string]interface{})["clip_name"] != "t5xxl_fp16.safetensors" {
-		t.Fatal("LTX text encoder filename does not match the staged asset")
-	}
-	assertComfyLink(t, workflow, "72", "positive", "69", 0)
-	assertComfyLink(t, workflow, "72", "sigmas", "71", 0)
-	assertComfyLink(t, workflow, "8", "vae", "44", 2)
-	assertComfyLink(t, workflow, "79", "video", "78", 0)
-	if !injectComfyPrompt(workflow, "a long tracking shot through a glass greenhouse") {
-		t.Fatal("LTX workflow did not accept the renter prompt")
-	}
-	positive := workflow["6"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
-	negative := workflow["7"].(map[string]interface{})["inputs"].(map[string]interface{})["text"]
-	if positive != "a long tracking shot through a glass greenhouse" || !strings.Contains(negative.(string), "motion artifacts") {
-		t.Fatalf("unexpected LTX prompts: positive=%q negative=%q", positive, negative)
-	}
-}
-
-func assertComfyLink(t *testing.T, workflow map[string]interface{}, nodeID, inputName, sourceID string, outputIndex float64) {
-	t.Helper()
-	node, ok := workflow[nodeID].(map[string]interface{})
-	if !ok {
-		t.Fatalf("workflow node %s is missing", nodeID)
-	}
-	inputs, ok := node["inputs"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("workflow node %s inputs are missing", nodeID)
-	}
-	link, ok := inputs[inputName].([]interface{})
-	if !ok || len(link) != 2 || link[0] != sourceID || link[1] != outputIndex {
-		t.Fatalf("workflow node %s input %s link = %v, want [%s %v]", nodeID, inputName, inputs[inputName], sourceID, outputIndex)
-	}
-}
-
 func TestDockerImageResolution(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -402,10 +196,9 @@ func TestDockerImageResolution(t *testing.T) {
 	}{
 		{"explicit DockerImage field", types.JobAssignment{DockerImage: "myimg:v1"}, "myimg:v1", false},
 		{"explicit param", types.JobAssignment{ModelName: "x", Parameters: map[string]interface{}{"docker_image": "myimg:v1"}}, "myimg:v1", false},
-		{"ltx-video requires worker", types.JobAssignment{ModelName: "ltx-video"}, "", true},
-		{"wan2 requires worker", types.JobAssignment{ModelName: "wan2"}, "", true},
+		{"named workload requires worker", types.JobAssignment{ModelName: "managed-media"}, "", true},
 		{"HF repo style requires worker", types.JobAssignment{ModelName: "org/model"}, "", true},
-		{"unknown no slash", types.JobAssignment{ModelName: "llama2"}, "", true},
+		{"unknown no slash", types.JobAssignment{ModelName: "unknown"}, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -427,26 +220,6 @@ func TestDockerImageResolution(t *testing.T) {
 }
 
 func TestResolveWorkspace(t *testing.T) {
-	// ComfyUI
-	img, ports, shm, vols, _ := resolveWorkspace(types.JobAssignment{ModelName: "comfyui"})
-	if img == "" {
-		t.Error("comfyui should resolve to an image")
-	}
-	if len(ports) == 0 {
-		t.Error("comfyui should have ports")
-	}
-	if shm == "" {
-		t.Error("comfyui should have shm_size")
-	}
-	if len(vols) == 0 {
-		t.Error("comfyui should have persistent volumes for model storage")
-	}
-	// Verify the models volume exists (most important for caching)
-	if _, ok := vols["tokenize-comfyui-models"]; !ok {
-		t.Error("comfyui should have a tokenize-comfyui-models volume")
-	}
-
-	// Explicit override
 	img2, ports2, _, _, _ := resolveWorkspace(types.JobAssignment{
 		ModelName:  "custom",
 		Parameters: map[string]interface{}{"docker_image": "myimg:v1", "ports": "9090"},

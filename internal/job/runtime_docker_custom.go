@@ -17,7 +17,6 @@ import (
 
 // customDockerRuntime runs jobs in a user-specified Docker image. Handles:
 //   - HuggingFace Docker image URLs
-//   - Well-known models (LTX-Video, Wan2, SDXL, FLUX)
 //   - Any custom Docker image the user provides
 //   - Custom files (LoRAs, workflows) mounted into the container
 type customDockerRuntime struct {
@@ -44,7 +43,7 @@ func newCustomDockerRuntime(cacheDir string, useGPU bool, gpuDevice string, jobT
 func (r *customDockerRuntime) Name() string { return "docker-custom" }
 
 // resolveJobImage determines the Docker image for this job using the full
-// resolution chain: DockerImage field → Parameters → well-known → HuggingFace.
+// resolution chain: DockerImage field, then the explicit parameters field.
 func resolveJobImage(a types.JobAssignment) (string, error) {
 	return ResolveImage(a)
 }

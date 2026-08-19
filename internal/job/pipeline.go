@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -113,6 +114,7 @@ var TrustedFileHosts = []string{
 	"hf.co",
 	"cdn-lfs.huggingface.co",
 	"civitai.com",
+	"civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
 	"raw.githubusercontent.com",
 	"github.com",
 	"storage.googleapis.com",
@@ -237,9 +239,18 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 			name = filepath.Base(f.Path)
 		}
 
-		pct := float64(i) / float64(len(files))
+		fileBase := float64(i) / float64(len(files))
+		fileSpan := 1 / float64(len(files))
 		if progress != nil {
-			progress("downloading_files", pct, fmt.Sprintf("Downloading %s (%d/%d)", name, i+1, len(files)))
+			progress("downloading_files", fileBase, fmt.Sprintf("Downloading %s (%d/%d)", name, i+1, len(files)))
+		}
+		downloadProgress := func(downloaded, total int64) {
+			if progress == nil || total <= 0 {
+				return
+			}
+			fraction := math.Min(1, float64(downloaded)/float64(total))
+			progress("downloading_files", fileBase+fileSpan*fraction,
+				fmt.Sprintf("Downloading %s (%s / %s)", name, formatDownloadBytes(downloaded), formatDownloadBytes(total)))
 		}
 
 		destPath := filepath.Join(stagingDir, f.Path)
@@ -268,7 +279,7 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 			sourcePath = destPath
 		}
 		if cachePath != "" {
-			if err := ensureCachedFile(ctx, f.URL, cachePath, f.SHA256); err != nil {
+			if err := ensureCachedFileWithProgress(ctx, f.URL, cachePath, f.SHA256, downloadProgress); err != nil {
 				return fmt.Errorf("download %s: %w", name, err)
 			}
 			if err := stageCachedFile(cachePath, destPath); err != nil {
@@ -279,7 +290,7 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 				return fmt.Errorf("verify %s: %w", name, err)
 			}
 		} else if info, statErr := os.Stat(sourcePath); statErr != nil || info.Size() == 0 {
-			if err := downloadFile(ctx, f.URL, sourcePath); err != nil {
+			if err := downloadFileWithProgress(ctx, f.URL, sourcePath, downloadProgress); err != nil {
 				return fmt.Errorf("download %s: %w", name, err)
 			}
 			if err := verifyFileSHA256(sourcePath, f.SHA256); err != nil {
@@ -296,13 +307,17 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 }
 
 func ensureCachedFile(ctx context.Context, sourceURL, cachePath, expectedSHA256 string) error {
+	return ensureCachedFileWithProgress(ctx, sourceURL, cachePath, expectedSHA256, nil)
+}
+
+func ensureCachedFileWithProgress(ctx context.Context, sourceURL, cachePath, expectedSHA256 string, progress func(int64, int64)) error {
 	lockValue, _ := customAssetDownloadLocks.LoadOrStore(cachePath, &sync.Mutex{})
 	assetLock := lockValue.(*sync.Mutex)
 	assetLock.Lock()
 	defer assetLock.Unlock()
 	if info, err := os.Stat(cachePath); err != nil || info.Size() == 0 || verifyFileSHA256(cachePath, expectedSHA256) != nil {
 		_ = os.Remove(cachePath)
-		if err := downloadFile(ctx, sourceURL, cachePath); err != nil {
+		if err := downloadFileWithProgress(ctx, sourceURL, cachePath, progress); err != nil {
 			return err
 		}
 	}
@@ -443,6 +458,37 @@ func stageCachedFile(source, destination string) error {
 }
 
 func downloadFile(ctx context.Context, url, dest string) error {
+	return downloadFileWithProgress(ctx, url, dest, nil)
+}
+
+type downloadProgressWriter struct {
+	written     int64
+	total       int64
+	lastPercent int64
+	progress    func(int64, int64)
+}
+
+func (w *downloadProgressWriter) Write(chunk []byte) (int, error) {
+	w.written += int64(len(chunk))
+	if w.progress != nil && w.total > 0 {
+		percent := w.written * 100 / w.total
+		if percent >= w.lastPercent+1 || w.written >= w.total {
+			w.lastPercent = percent
+			w.progress(w.written, w.total)
+		}
+	}
+	return len(chunk), nil
+}
+
+func formatDownloadBytes(bytes int64) string {
+	const mebibyte = 1024 * 1024
+	if bytes >= mebibyte {
+		return fmt.Sprintf("%.1f GiB", float64(bytes)/(1024*mebibyte))
+	}
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/mebibyte)
+}
+
+func downloadFileWithProgress(ctx context.Context, url, dest string, progress func(int64, int64)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -486,17 +532,19 @@ func downloadFile(ctx context.Context, url, dest string) error {
 		}
 	}()
 
+	progressWriter := &downloadProgressWriter{total: resp.ContentLength, lastPercent: -1, progress: progress}
+	writer := io.MultiWriter(f, progressWriter)
 	if limit > 0 {
 		// Read one byte past the limit so we can detect an over-cap stream even
 		// when Content-Length was missing or understated.
-		n, copyErr := io.Copy(f, io.LimitReader(resp.Body, limit+1))
+		n, copyErr := io.Copy(writer, io.LimitReader(resp.Body, limit+1))
 		if copyErr != nil {
 			return copyErr
 		}
 		if n > limit {
 			return fmt.Errorf("download from %s exceeded max allowed %d bytes", url, limit)
 		}
-	} else if _, err = io.Copy(f, resp.Body); err != nil {
+	} else if _, err = io.Copy(writer, resp.Body); err != nil {
 		return err
 	}
 	if err := f.Close(); err != nil {

@@ -3,6 +3,10 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## Unreleased
+
+- Tightened workload assignment validation and removed local runtime guessing.
+
 ## [1.3.2] - 2026-08-18
 
 - Added support for new image and video generation workloads.

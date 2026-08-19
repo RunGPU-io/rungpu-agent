@@ -3,17 +3,17 @@
 //
 // There are two personas in the Tokenize marketplace:
 //
-//   GPU HOST (you, running this agent):
-//     Your machine runs the agent. The agent detects your GPU, pulls models/images,
-//     manages Docker containers, and serves inference. You earn money.
+//	GPU HOST (you, running this agent):
+//	  Your machine runs the agent. The agent detects your GPU, pulls models/images,
+//	  manages Docker containers, and serves inference. You earn money.
 //
-//   CUSTOMER (someone on the internet):
-//     They submit jobs via the Tokenize API or dashboard. The pool coordinator
-//     routes their request to your agent. They get back results.
+//	CUSTOMER (someone on the internet):
+//	  They submit jobs via the Tokenize API or dashboard. The pool coordinator
+//	  routes their request to your agent. They get back results.
 //
 // This local test simulates both sides:
-//   1. It starts the agent (host side)
-//   2. It exposes an HTTP inference URL (what the customer hits)
+//  1. It starts the agent (host side)
+//  2. It exposes an HTTP inference URL (what the customer hits)
 //
 // Usage:
 //
@@ -49,7 +49,7 @@ import (
 )
 
 func main() {
-	model := flag.String("model", "llama3.2", "Model to run (llama3.2, comfyui, stable-diffusion, etc.)")
+	model := flag.String("model", "example:latest", "Coordinator-assigned model identifier")
 	prompt := flag.String("prompt", "Explain what a GPU agent is in 2 sentences.", "Prompt for one-shot inference")
 	lora := flag.String("lora", "", "LoRA URL to download (from Civitai or HuggingFace)")
 	loraName := flag.String("lora-name", "custom_lora", "Name for the LoRA file")

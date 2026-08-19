@@ -108,7 +108,7 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	// (or shutdown) can interrupt this job.
 	jobCtx, cancel := context.WithCancel(ctx)
 	e.trackInflight(a.JobID, cancel)
-	workspace := isWorkspaceJob(a)
+	workspace := a.Runtime == "workspace"
 	if !workspace {
 		jobTimeout := e.jobTimeout
 		if jobTimeout <= 0 {
@@ -176,8 +176,9 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 		// Look for output file path in the result
 		if outputPath, ok := out["output_file"].(string); ok && outputPath != "" {
 			if uploadErr := UploadOutput(ctx, outputPath, a.UploadURL); uploadErr != nil {
-				// Don't fail the job — just note the upload error
-				out["upload_error"] = uploadErr.Error()
+				res.Success = false
+				res.Error = "output upload failed: " + uploadErr.Error()
+				return res
 			} else {
 				out["uploaded"] = true
 				if info, statErr := os.Stat(outputPath); statErr == nil {

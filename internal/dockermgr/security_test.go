@@ -26,7 +26,7 @@ func TestPolicyFromConfig(t *testing.T) {
 		t.Errorf("config trusted registry should pass: %v", err)
 	}
 	// Built-in trusted registries still work with a config-derived policy.
-	if err := ValidateImage("ghcr.io/tokenize/ltx-video:latest", PolicyFromConfig(types.SecurityConfig{})); err != nil {
+	if err := ValidateImage("ghcr.io/tokenize/example-worker:latest", PolicyFromConfig(types.SecurityConfig{})); err != nil {
 		t.Errorf("built-in trusted registry should still pass under config policy: %v", err)
 	}
 }
@@ -36,10 +36,10 @@ func TestValidateImageTrusted(t *testing.T) {
 
 	// Trusted registries should pass
 	trusted := []string{
-		"ghcr.io/tokenize/ltx-video:latest",
+		"ghcr.io/tokenize/example-worker:latest",
 		"ghcr.io/ai-dock/comfyui:latest",
 		"ghcr.io/invoke-ai/invokeai:latest",
-		"registry.hf.space/Lightricks-LTX-Video",
+		"registry.hf.space/example-worker",
 		"jupyter/pytorch-notebook:latest",
 		"pytorch/pytorch:2.0-cuda11.8",
 		"nvcr.io/nvidia/pytorch:latest",

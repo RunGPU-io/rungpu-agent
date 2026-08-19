@@ -166,6 +166,10 @@ max_custom_asset_cache_gb: 20 # -1 disables size-based LRU eviction
 
 Every workload runs in a sandboxed container. You control what's allowed via the [web dashboard](https://www.rungpu.io/marketplace/host) or config file.
 
+RunGPU's coordinator selects each workload runtime and its approved assets. The
+agent does not infer runtimes from model names; incomplete assignments are
+rejected locally.
+
 ## Uninstall
 
 ```bash

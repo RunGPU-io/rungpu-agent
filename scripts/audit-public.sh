@@ -45,6 +45,11 @@ if [[ -n "$forbidden_files" ]]; then
     fail=1
 fi
 
+if [[ -n "$(find presets -type f -print -quit 2>/dev/null || true)" ]]; then
+    echo "ERROR: model preset workflows must remain in the coordinator repository"
+    fail=1
+fi
+
 report_matches "a live credential-shaped value is present" \
     '(sk_live_[A-Za-z0-9]{16,}|sk_test_[A-Za-z0-9]{16,}|pk_live_[A-Za-z0-9]{16,}|sbp_[A-Za-z0-9_-]{16,}|hf_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|postgres(ql)?://[^[:space:]/]+:[^[:space:]@]+@|https://[^/[:space:]]+:[^/[:space:]]+@)' \
     .
@@ -54,8 +59,12 @@ report_matches "a local absolute path is present" \
     . ':(exclude)scripts/audit-public.sh'
 
 report_matches "coordinator-only policy leaked into public agent source" \
-    '(PLATFORM_FEE_PERCENT|TARGET_MARGIN|gpu_owner_share|settlement|stripe_transfer|payout_status|load-balancer|queue-dispatcher)' \
-    '*.go' '*.sh' '*.ps1' ':(exclude)scripts/audit-public.sh'
+    '(PLATFORM_FEE_PERCENT|TARGET_MARGIN|gpu_owner_share|settlement|stripe_transfer|payout_status|load-balancer|queue-dispatcher|applyComfyGenerationOptions|isKnownDockerModel|knownWorkspaces|ltx-video-0\.9|wan-2\.1-|sdxl-base|stable-diffusion-1\.5)' \
+    '*.go' '*.sh' '*.ps1' ':(exclude)scripts/audit-public.sh' \
+    ':(exclude)*_integration_test.go' ':(exclude)*_e2e_test.go' \
+    ':(exclude)bootstrap_test.go' ':(exclude)full_pipeline_test.go' \
+    ':(exclude)media_pipeline_test.go' ':(exclude)preset_workflows_test.go' \
+    ':(exclude)hardening_test.go' ':(exclude)executor_test.go'
 
 report_matches_except_literal "private coordinator configuration leaked into public agent source" \
     '(POOL_API_SECRET|JWT_SECRET|DATABASE_URL|REDIS_URL|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_ACCESS_TOKEN|rungpu-504008|420004393585|gjwmnwdlbsgyucnjgqck|\.run\.app)' \

@@ -11,81 +11,49 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
-// Runtime executes inference jobs for a particular accelerator backend.
 type Runtime interface {
 	Name() string
-	Prepare(ctx context.Context, a types.JobAssignment) error
-	Run(ctx context.Context, a types.JobAssignment) (map[string]interface{}, error)
+	Prepare(ctx context.Context, assignment types.JobAssignment) error
+	Run(ctx context.Context, assignment types.JobAssignment) (map[string]interface{}, error)
 	Cleanup(force bool) error
 }
 
-// multiRuntime holds all available runtimes and picks the right one per job.
 type multiRuntime struct {
-	ollama       Runtime // text LLMs via Ollama
-	dockerCustom Runtime // batch inference (video/image gen)
-	comfyUIBatch Runtime // public ComfyUI API workflows on the internal image
-	workspace    Runtime // long-running interactive (ComfyUI, Jupyter)
+	ollama       Runtime
+	dockerCustom Runtime
+	comfyUIBatch Runtime
+	workspace    Runtime
 	hasOllama    bool
 	hasDocker    bool
-	backend      string
 }
 
-// RuntimeOptions tunes container execution beyond the basic backend/cache args.
 type RuntimeOptions struct {
-	GPUDevice  string                   // "" or "all" → all GPUs; else --gpus device=<GPUDevice>
-	JobTimeout time.Duration            // batch job cap; 0 → 60m default
-	Policy     dockermgr.SecurityPolicy // container sandbox policy (zero value == DefaultPolicy)
+	GPUDevice  string
+	JobTimeout time.Duration
+	Policy     dockermgr.SecurityPolicy
 }
 
-// NewRuntime creates a runtime with default options (all GPUs, 60m timeout).
 func NewRuntime(backend, cacheDir string, maxCacheGB int) (Runtime, error) {
 	return NewRuntimeOpts(backend, cacheDir, maxCacheGB, RuntimeOptions{})
 }
 
-// NewRuntimeOpts creates a runtime that can handle multiple model types:
-//   - Text LLMs → Ollama
-//   - Video/image generation → Docker custom image (batch)
-//   - Interactive environments (ComfyUI, Jupyter) → Docker workspace (long-running with ports)
-//
-// Runtime requirements are installed only through the explicit setup command.
-func NewRuntimeOpts(backend, cacheDir string, maxCacheGB int, opts RuntimeOptions) (Runtime, error) {
+func NewRuntimeOpts(backend, cacheDir string, maxCacheGB int, options RuntimeOptions) (Runtime, error) {
 	hasOllama := runtimeCommandAvailable("ollama", "--version")
 	hasDocker := runtimeCommandAvailable("docker", "version")
-	useGPU := strings.ToLower(backend) == "cuda"
-
-	mr := &multiRuntime{
-		hasOllama: hasOllama,
-		hasDocker: hasDocker,
-		backend:   backend,
-	}
-
+	useGPU := strings.EqualFold(backend, "cuda")
+	runtime := &multiRuntime{hasOllama: hasOllama, hasDocker: hasDocker}
 	if hasOllama {
-		mr.ollama = newOllamaRuntime(cacheDir)
+		runtime.ollama = newOllamaRuntime(cacheDir)
 	}
 	if hasDocker {
-		mr.dockerCustom = newCustomDockerRuntime(cacheDir, useGPU, opts.GPUDevice, opts.JobTimeout, opts.Policy)
-		mr.comfyUIBatch = newComfyUIBatchRuntime(cacheDir, useGPU, opts.GPUDevice, opts.Policy)
-		mr.workspace = newWorkspaceRuntime(cacheDir, useGPU, opts.GPUDevice, opts.Policy)
+		runtime.dockerCustom = newCustomDockerRuntime(cacheDir, useGPU, options.GPUDevice, options.JobTimeout, options.Policy)
+		runtime.comfyUIBatch = newComfyUIBatchRuntime(cacheDir, useGPU, options.GPUDevice, options.Policy)
+		runtime.workspace = newWorkspaceRuntime(cacheDir, useGPU, options.GPUDevice, options.Policy)
 	}
-
 	if !hasOllama && !hasDocker {
-		fmt.Println("[runtime] WARNING: neither ollama nor docker found")
-		fmt.Println("  Install runtime requirements with: rungpu-agent setup")
-		fmt.Println("  Install docker for video/image/workspace jobs: https://docs.docker.com/get-docker/")
-	} else {
-		if hasOllama {
-			fmt.Println("[runtime] ✅ Ollama available — text LLM inference supported")
-		} else {
-			fmt.Println("[runtime] ⚠ Ollama not available — text LLM jobs will fail")
-		}
-		if hasDocker {
-			fmt.Printf("[runtime] ✅ Docker available (GPU=%v) — video/image gen + workspaces supported\n", useGPU)
-		} else {
-			fmt.Println("[runtime] ⚠ Docker not found — video/image/workspace jobs will fail")
-		}
+		fmt.Println("[runtime] No supported runtime detected. Run: rungpu-agent setup")
 	}
-
-	return mr, nil
+	return runtime, nil
 }
 
 func runtimeCommandAvailable(name string, args ...string) bool {
@@ -108,159 +76,49 @@ func (m *multiRuntime) Name() string {
 	return strings.Join(parts, "+")
 }
 
-// selectRuntime picks the right runtime for a given job:
-//
-//  1. workspace=true or known workspace name → workspace runtime (long-running, ports exposed)
-//  2. docker_image param or known video/image model → custom Docker runtime (batch)
-//  3. Everything else → Ollama (text LLMs)
-func (m *multiRuntime) selectRuntime(a types.JobAssignment) (Runtime, error) {
-	if a.Runtime != "" {
-		switch a.Runtime {
-		case "comfyui-batch":
-			if m.comfyUIBatch != nil {
-				return m.comfyUIBatch, nil
-			}
-			return nil, fmt.Errorf("ComfyUI workflow jobs require Docker on the GPU host")
-		case "workspace":
-			if m.workspace != nil {
-				return m.workspace, nil
-			}
-			return nil, fmt.Errorf("workspace jobs require Docker")
-		case "docker-custom":
-			if m.dockerCustom != nil {
-				return m.dockerCustom, nil
-			}
-			return nil, fmt.Errorf("Docker batch jobs require Docker on the GPU host")
-		case "ollama":
-			if m.ollama != nil {
-				return m.ollama, nil
-			}
-			return nil, fmt.Errorf("text inference jobs require Ollama on the GPU host")
-		default:
-			return nil, fmt.Errorf("unsupported execution runtime %q", a.Runtime)
-		}
-	}
-
-	// Compatibility for assignments created by coordinators before runtime
-	// became an explicit wire-protocol field.
-	if isComfyUIBatchJob(a) {
+func (m *multiRuntime) selectRuntime(assignment types.JobAssignment) (Runtime, error) {
+	switch assignment.Runtime {
+	case "comfyui-batch":
 		if m.comfyUIBatch != nil {
 			return m.comfyUIBatch, nil
 		}
-		return nil, fmt.Errorf("ComfyUI workflow jobs require Docker on the GPU host")
-	}
-
-	// Check for workspace mode
-	if isWorkspaceJob(a) {
+		return nil, fmt.Errorf("requested runtime is unavailable: comfyui-batch")
+	case "workspace":
 		if m.workspace != nil {
 			return m.workspace, nil
 		}
-		return nil, fmt.Errorf("workspace jobs require Docker — install Docker to run ComfyUI, Jupyter, etc.")
-	}
-
-	// Check for Docker-based model (video/image gen)
-	if hasExplicitDockerImage(a) || isKnownDockerModel(a.ModelName) {
+		return nil, fmt.Errorf("requested runtime is unavailable: workspace")
+	case "docker-custom":
 		if m.dockerCustom != nil {
 			return m.dockerCustom, nil
 		}
-		return nil, fmt.Errorf("model %q requires Docker but docker is not installed", a.ModelName)
+		return nil, fmt.Errorf("requested runtime is unavailable: docker-custom")
+	case "ollama":
+		if m.ollama != nil {
+			return m.ollama, nil
+		}
+		return nil, fmt.Errorf("requested runtime is unavailable: ollama")
+	case "":
+		return nil, fmt.Errorf("execution runtime is required")
+	default:
+		return nil, fmt.Errorf("unsupported execution runtime %q", assignment.Runtime)
 	}
-
-	// Default: Ollama for text LLMs
-	if m.ollama != nil {
-		return m.ollama, nil
-	}
-
-	// No Ollama — try Docker as fallback
-	if m.dockerCustom != nil {
-		return m.dockerCustom, nil
-	}
-
-	return nil, fmt.Errorf("no runtime available for model %q — install ollama (text LLMs) or docker (video/image/workspace)", a.ModelName)
 }
 
-func isComfyUIBatchJob(a types.JobAssignment) bool {
-	if a.Parameters == nil {
-		return false
-	}
-	runtimeName, _ := a.Parameters["runtime"].(string)
-	return runtimeName == "comfyui-batch"
-}
-
-// isWorkspaceJob returns true if the job should run as a long-lived workspace.
-func isWorkspaceJob(a types.JobAssignment) bool {
-	// Check the dedicated Workspace field first
-	if a.Workspace {
-		return true
-	}
-	// Check Parameters for backward compat
-	if a.Parameters != nil {
-		if ws, ok := a.Parameters["workspace"].(bool); ok && ws {
-			return true
-		}
-		if ws, ok := a.Parameters["workspace"].(string); ok && (ws == "true" || ws == "1") {
-			return true
-		}
-	}
-	// Check known workspace names
-	lower := strings.ToLower(a.ModelName)
-	for name := range knownWorkspaces {
-		if lower == name {
-			return true
-		}
-	}
-	return false
-}
-
-func hasExplicitDockerImage(a types.JobAssignment) bool {
-	if a.DockerImage != "" {
-		return true
-	}
-	if a.Parameters == nil {
-		return false
-	}
-	img, ok := a.Parameters["docker_image"].(string)
-	return ok && img != ""
-}
-
-// isKnownDockerModel returns true for models that need Docker (not Ollama).
-func isKnownDockerModel(name string) bool {
-	lower := strings.ToLower(name)
-	dockerModels := []string{
-		"ltx", "ltx-video", "ltx2", "ltx2-video",
-		"wan2", "wan2.1", "wan2.2", "wan2-video",
-		"stable-diffusion", "sdxl", "sd", "sd3",
-		"flux", "flux.1", "flux-dev", "flux-schnell",
-		"z-image", "qwen-image", "hidream",
-		"whisper", "musicgen",
-	}
-	for _, m := range dockerModels {
-		if lower == m || strings.HasPrefix(lower, m+"-") || strings.HasPrefix(lower, m+"/") {
-			return true
-		}
-	}
-	for _, kw := range []string{"video", "image-gen", "diffusion", "img2img", "txt2img"} {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *multiRuntime) Prepare(ctx context.Context, a types.JobAssignment) error {
-	rt, err := m.selectRuntime(a)
+func (m *multiRuntime) Prepare(ctx context.Context, assignment types.JobAssignment) error {
+	runtime, err := m.selectRuntime(assignment)
 	if err != nil {
 		return err
 	}
-	return rt.Prepare(ctx, a)
+	return runtime.Prepare(ctx, assignment)
 }
 
-func (m *multiRuntime) Run(ctx context.Context, a types.JobAssignment) (map[string]interface{}, error) {
-	rt, err := m.selectRuntime(a)
+func (m *multiRuntime) Run(ctx context.Context, assignment types.JobAssignment) (map[string]interface{}, error) {
+	runtime, err := m.selectRuntime(assignment)
 	if err != nil {
 		return nil, err
 	}
-	return rt.Run(ctx, a)
+	return runtime.Run(ctx, assignment)
 }
 
 func (m *multiRuntime) Cleanup(force bool) error {
@@ -273,10 +131,12 @@ func (m *multiRuntime) Cleanup(force bool) error {
 	if m.comfyUIBatch != nil {
 		m.comfyUIBatch.Cleanup(force)
 	}
+	if m.workspace != nil {
+		m.workspace.Cleanup(force)
+	}
 	return nil
 }
 
-// modelID normalizes a model name into a filesystem-safe cache key.
 func modelID(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
 }

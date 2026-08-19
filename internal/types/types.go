@@ -105,8 +105,7 @@ type JobAssignment struct {
 	// ── Docker image source ─────────────────────────────────────────────
 	// The image to run. Can be:
 	//   - A HuggingFace Docker image URL (e.g. "registry.hf.space/org/model")
-	//   - A Docker Hub / GHCR image (e.g. "ghcr.io/tokenize/ltx-video:latest")
-	//   - Empty → derived from ModelName for well-known models
+	//   - A Docker Hub / GHCR image selected by the coordinator
 	DockerImage string `json:"docker_image,omitempty"`
 
 	// ── Custom files to inject into the container ───────────────────────

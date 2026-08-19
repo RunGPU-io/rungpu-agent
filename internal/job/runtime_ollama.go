@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	rt "runtime"
-	"strings"
 	"time"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
@@ -46,11 +45,7 @@ func ollamaModel(a types.JobAssignment) string {
 			return v
 		}
 	}
-	name := a.ModelName
-	if i := strings.LastIndex(name, "/"); i >= 0 {
-		name = name[i+1:]
-	}
-	return strings.ToLower(name)
+	return a.ModelName
 }
 
 // extractPrompt pulls a text prompt out of the job input.

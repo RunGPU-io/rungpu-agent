@@ -13,8 +13,6 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
-const comfyUIBatchImage = "ghcr.io/ai-dock/comfyui:latest"
-
 var comfyUIBatchVolumes = []string{
 	"tokenize-comfyui-models:/opt/ComfyUI/models",
 	"tokenize-comfyui-nodes:/opt/ComfyUI/custom_nodes",
@@ -41,14 +39,17 @@ func (r *comfyUIBatchRuntime) Prepare(ctx context.Context, a types.JobAssignment
 	if _, err := r.workflowPath(a); err != nil {
 		return err
 	}
+	if a.DockerImage == "" {
+		return fmt.Errorf("ComfyUI generation requires a coordinator-selected docker_image")
+	}
 	if !r.docker.Available(ctx) {
 		return fmt.Errorf("ComfyUI generation requires Docker on the GPU host")
 	}
-	if err := dockermgr.ValidateImage(comfyUIBatchImage, r.docker.Policy); err != nil {
+	if err := dockermgr.ValidateImage(a.DockerImage, r.docker.Policy); err != nil {
 		return fmt.Errorf("security: %w", err)
 	}
-	if out, err := exec.CommandContext(ctx, "docker", "image", "inspect", comfyUIBatchImage).CombinedOutput(); err != nil || len(out) < 3 {
-		if pullOut, pullErr := exec.CommandContext(ctx, "docker", "pull", comfyUIBatchImage).CombinedOutput(); pullErr != nil {
+	if out, err := exec.CommandContext(ctx, "docker", "image", "inspect", a.DockerImage).CombinedOutput(); err != nil || len(out) < 3 {
+		if pullOut, pullErr := exec.CommandContext(ctx, "docker", "pull", a.DockerImage).CombinedOutput(); pullErr != nil {
 			return fmt.Errorf("pull internal ComfyUI runtime: %v: %s", pullErr, strings.TrimSpace(string(pullOut)))
 		}
 	}
@@ -96,10 +97,10 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	}
 	mounts = append(mounts, stagingDir+":/custom:ro", outputDir+":/opt/ComfyUI/output")
 	if _, err := r.docker.Run(ctx, dockermgr.RunOptions{
-		Image: comfyUIBatchImage, Name: containerName,
+		Image: a.DockerImage, Name: containerName,
 		UseGPU: r.useGPU, GPUDevice: r.gpuDevice,
 		Network: "none",
-		Mounts: mounts, Volumes: volumes, ShmSize: "8g",
+		Mounts:  mounts, Volumes: volumes, ShmSize: "8g",
 	}); err != nil {
 		return nil, fmt.Errorf("start internal ComfyUI runtime: %w", err)
 	}

@@ -1,6 +1,7 @@
 package job
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,18 +44,8 @@ func TestResolveImage(t *testing.T) {
 			"img:v2", false,
 		},
 		{
-			"ltx-video requires explicit batch worker",
-			types.JobAssignment{ModelName: "ltx-video"},
-			"", true,
-		},
-		{
-			"wan2 requires explicit batch worker",
-			types.JobAssignment{ModelName: "wan2"},
-			"", true,
-		},
-		{
-			"comfyui batch requires explicit worker",
-			types.JobAssignment{ModelName: "comfyui"},
+			"named workload requires explicit worker",
+			types.JobAssignment{ModelName: "managed-media"},
 			"", true,
 		},
 		{
@@ -62,8 +54,8 @@ func TestResolveImage(t *testing.T) {
 			"", true,
 		},
 		{
-			"HuggingFace repo style requires explicit worker",
-			types.JobAssignment{ModelName: "stabilityai/stable-diffusion-xl"},
+			"repository style identifier requires explicit worker",
+			types.JobAssignment{ModelName: "organization/model"},
 			"", true,
 		},
 		{
@@ -97,6 +89,7 @@ func TestValidateCustomFileURL(t *testing.T) {
 	trusted := []struct{ url, path string }{
 		{"https://huggingface.co/user/model/resolve/main/lora.safetensors", "models/loras/lora.safetensors"},
 		{"https://civitai.com/api/download/models/123", "models/loras/anime.safetensors"},
+		{"https://civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com/model/123/model.safetensors", "models/checkpoints/model.safetensors"},
 		{"https://raw.githubusercontent.com/user/repo/main/workflow.json", "workflows/wf.json"},
 		{"https://storage.googleapis.com/bucket/model.safetensors", "models/model.safetensors"},
 		{"https://cdn-lfs.huggingface.co/repos/abc/model.safetensors", "models/m.safetensors"},
@@ -111,6 +104,7 @@ func TestValidateCustomFileURL(t *testing.T) {
 	untrusted := []struct{ url, path string }{
 		{"https://evil.io/malware.safetensors", "models/m.safetensors"},
 		{"https://randomsite.com/lora.safetensors", "models/lora.safetensors"},
+		{"https://untrusted.r2.cloudflarestorage.com/model.safetensors", "models/m.safetensors"},
 		{"http://huggingface.co/model.safetensors", "models/m.safetensors"}, // HTTP not HTTPS
 		{"ftp://huggingface.co/model.safetensors", "models/m.safetensors"},  // FTP
 	}
@@ -189,6 +183,32 @@ func TestDownloadCustomFilesEmpty(t *testing.T) {
 	err := DownloadCustomFiles(context.Background(), nil, t.TempDir(), nil)
 	if err != nil {
 		t.Errorf("empty files should not error: %v", err)
+	}
+}
+
+func TestDownloadFileReportsByteProgress(t *testing.T) {
+	content := bytes.Repeat([]byte("x"), 2*1024*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		for offset := 0; offset < len(content); offset += 64 * 1024 {
+			end := offset + 64*1024
+			if end > len(content) {
+				end = len(content)
+			}
+			_, _ = w.Write(content[offset:end])
+		}
+	}))
+	defer server.Close()
+
+	var fractions []float64
+	err := downloadFileWithProgress(context.Background(), server.URL, filepath.Join(t.TempDir(), "model.safetensors"), func(downloaded, total int64) {
+		fractions = append(fractions, float64(downloaded)/float64(total))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fractions) < 2 || fractions[0] <= 0 || fractions[0] >= 1 || fractions[len(fractions)-1] != 1 {
+		t.Fatalf("byte progress = %v, want intermediate updates ending at 1", fractions)
 	}
 }
 
