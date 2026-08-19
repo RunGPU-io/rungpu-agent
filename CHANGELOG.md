@@ -3,9 +3,11 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
-## Unreleased
+## [1.3.4] - 2026-08-19
 
 - Tightened workload assignment validation and removed local runtime guessing.
+- Made required managed-result upload failures fail the job instead of
+	reporting completion without a retrievable result.
 
 ## [1.3.2] - 2026-08-18
 
