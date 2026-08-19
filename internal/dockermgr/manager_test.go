@@ -52,15 +52,16 @@ func TestBuildRunArgsGPUScoping(t *testing.T) {
 func TestBuildRunArgsComposition(t *testing.T) {
 	m := New()
 	args := m.buildRunArgs(RunOptions{
-		Image:   "ghcr.io/tokenize/x:latest",
-		Name:    "job-c",
-		Network: "none",
-		Ports:   []string{"127.0.0.1:8188:8188"},
-		Mounts:  []string{"/home/u/.tokenize/cache:/cache"},
-		Volumes: []string{"tokenize-vol:/data"},
-		Env:     map[string]string{"FOO": "bar"},
-		ShmSize: "8g",
-		Command: []string{"serve"},
+		Image:      "ghcr.io/tokenize/x:latest",
+		Name:       "job-c",
+		Network:    "none",
+		Ports:      []string{"127.0.0.1:8188:8188"},
+		Mounts:     []string{"/home/u/.tokenize/cache:/cache"},
+		Volumes:    []string{"tokenize-vol:/data"},
+		Env:        map[string]string{"FOO": "bar"},
+		ShmSize:    "8g",
+		Entrypoint: "python",
+		Command:    []string{"serve"},
 	})
 
 	joined := strings.Join(args, " ")
@@ -73,6 +74,7 @@ func TestBuildRunArgsComposition(t *testing.T) {
 		"-v /home/u/.tokenize/cache:/cache",
 		"-v tokenize-vol:/data",
 		"-e FOO=bar",
+		"--entrypoint python",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args missing %q\n got: %s", want, joined)

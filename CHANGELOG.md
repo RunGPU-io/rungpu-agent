@@ -3,6 +3,10 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.9] - 2026-08-19
+
+- Improved compatibility and validation for managed generation workloads.
+
 ## [1.3.8] - 2026-08-19
 
 - Improved agent startup and managed workload reliability.

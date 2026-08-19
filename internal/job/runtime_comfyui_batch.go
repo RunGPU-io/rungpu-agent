@@ -14,10 +14,26 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
-var comfyUIBatchVolumes = []string{
-	"tokenize-comfyui-models:/opt/ComfyUI/models",
-	"tokenize-comfyui-nodes:/opt/ComfyUI/custom_nodes",
-	"tokenize-comfyui-input:/opt/ComfyUI/input",
+const modernComfyUIImagePrefix = "ghcr.io/clsferguson/comfyui-docker"
+
+type comfyUILayout struct {
+	root       string
+	entrypoint string
+	command    []string
+	supervised bool
+	extraEnv   map[string]string
+}
+
+func comfyUILayoutForImage(image string) comfyUILayout {
+	if strings.HasPrefix(strings.ToLower(image), modernComfyUIImagePrefix) {
+		return comfyUILayout{
+			root:       "/app/ComfyUI",
+			entrypoint: "python",
+			command:    []string{"main.py", "--listen", "127.0.0.1", "--port", "8188", "--disable-auto-launch"},
+			extraEnv:   map[string]string{"COMFY_AUTO_INSTALL": "0"},
+		}
+	}
+	return comfyUILayout{root: "/opt/ComfyUI", supervised: true}
 }
 
 type comfyUIBatchRuntime struct {
@@ -92,23 +108,29 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	}
 	containerName := CustomContainerName(a.JobID)
 	stagingDir := filepath.Join(r.cacheDir, "staging", a.JobID)
-	mounts, volumes, err := comfyUIBatchStorage(stagingDir)
+	layout := comfyUILayoutForImage(a.DockerImage)
+	mounts, volumes, err := comfyUIBatchStorage(stagingDir, layout)
 	if err != nil {
 		return nil, err
 	}
-	mounts = append(mounts, stagingDir+":/custom:ro", outputDir+":/opt/ComfyUI/output")
+	mounts = append(mounts, stagingDir+":/custom:ro", outputDir+":"+layout.root+"/output")
+	env := comfyUIBatchEnv()
+	for key, value := range layout.extraEnv {
+		env[key] = value
+	}
 	if _, err := r.docker.Run(ctx, dockermgr.RunOptions{
 		Image: a.DockerImage, Name: containerName,
 		UseGPU: r.useGPU, GPUDevice: r.gpuDevice,
 		Network: "none",
 		Mounts:  mounts, Volumes: volumes, ShmSize: "8g",
+		Entrypoint: layout.entrypoint, Command: layout.command,
 		// ai-dock documents these settings in its docker-compose example, but
 		// they are not baked into the image config. In particular, WAN address
 		// discovery and quick tunnels cannot succeed under Network=none and may
 		// delay or prevent the supervised ComfyUI service from becoming ready.
 		// Batch inference needs only the container-local API, so keep it bound
 		// to loopback and disable every network-dependent startup feature.
-		Env: comfyUIBatchEnv(),
+		Env: env,
 	}); err != nil {
 		return nil, fmt.Errorf("start internal ComfyUI runtime: %w", err)
 	}
@@ -128,7 +150,7 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		if running, exitCode, inspectErr := r.docker.Inspect(context.Background(), containerName); inspectErr == nil && !running {
 			message = fmt.Sprintf("%s (ComfyUI container exited with code %d)", message, exitCode)
 		}
-		diagnostics := r.comfyUIDiagnostics(containerName)
+		diagnostics := r.comfyUIDiagnostics(containerName, layout)
 		if diagnostics != "" {
 			message += "\n" + diagnostics
 		}
@@ -178,16 +200,18 @@ func comfyUIBatchEnv() map[string]string {
 // comfyUIDiagnostics captures service state and recent logs before the deferred
 // cleanup removes the failed container. This is intentionally best-effort:
 // diagnostics must never replace the original workflow error.
-func (r *comfyUIBatchRuntime) comfyUIDiagnostics(containerName string) string {
+func (r *comfyUIBatchRuntime) comfyUIDiagnostics(containerName string, layout comfyUILayout) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	parts := make([]string, 0, 2)
-	if output, err := exec.CommandContext(
-		ctx, "docker", "exec", containerName,
-		"supervisorctl", "status", "comfyui",
-	).CombinedOutput(); err == nil || len(output) > 0 {
-		parts = append(parts, "ComfyUI service status:\n"+strings.TrimSpace(string(output)))
+	if layout.supervised {
+		if output, err := exec.CommandContext(
+			ctx, "docker", "exec", containerName,
+			"supervisorctl", "status", "comfyui",
+		).CombinedOutput(); err == nil || len(output) > 0 {
+			parts = append(parts, "ComfyUI service status:\n"+strings.TrimSpace(string(output)))
+		}
 	}
 	if logs, err := r.docker.Logs(ctx, containerName, 200); err == nil && strings.TrimSpace(logs) != "" {
 		parts = append(parts, "Recent container logs:\n"+strings.TrimSpace(logs))
@@ -195,11 +219,18 @@ func (r *comfyUIBatchRuntime) comfyUIDiagnostics(containerName string) string {
 	return strings.Join(parts, "\n")
 }
 
-func comfyUIBatchStorage(stagingDir string) ([]string, []string, error) {
+func comfyUIBatchStorage(stagingDir string, layout comfyUILayout) ([]string, []string, error) {
 	modelsDir := filepath.Join(stagingDir, "models")
 	info, err := os.Stat(modelsDir)
 	if os.IsNotExist(err) {
-		return nil, append([]string(nil), comfyUIBatchVolumes...), nil
+		volumes := []string{"tokenize-comfyui-models:" + layout.root + "/models"}
+		if layout.supervised {
+			volumes = append(volumes,
+				"tokenize-comfyui-nodes:"+layout.root+"/custom_nodes",
+				"tokenize-comfyui-input:"+layout.root+"/input",
+			)
+		}
+		return nil, volumes, nil
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("inspect staged ComfyUI models: %w", err)
@@ -207,13 +238,14 @@ func comfyUIBatchStorage(stagingDir string) ([]string, []string, error) {
 	if !info.IsDir() {
 		return nil, nil, fmt.Errorf("staged ComfyUI models path is not a directory")
 	}
-	volumes := make([]string, 0, len(comfyUIBatchVolumes)-1)
-	for _, volume := range comfyUIBatchVolumes {
-		if !strings.HasSuffix(volume, ":/opt/ComfyUI/models") {
-			volumes = append(volumes, volume)
+	volumes := []string(nil)
+	if layout.supervised {
+		volumes = []string{
+			"tokenize-comfyui-nodes:" + layout.root + "/custom_nodes",
+			"tokenize-comfyui-input:" + layout.root + "/input",
 		}
 	}
-	return []string{modelsDir + ":/opt/ComfyUI/models:ro"}, volumes, nil
+	return []string{modelsDir + ":" + layout.root + "/models:ro"}, volumes, nil
 }
 
 func (r *comfyUIBatchRuntime) workflowPath(a types.JobAssignment) (string, error) {
@@ -335,6 +367,19 @@ else:
     raise SystemExit("ComfyUI did not become ready after 300 seconds; last probe: " + last_error)
 with open(request_path, "rb") as handle:
     payload = handle.read()
+request_document = json.loads(payload)
+workflow = request_document.get("prompt", {})
+required_nodes = {
+    node.get("class_type")
+    for node in workflow.values()
+    if isinstance(node, dict) and isinstance(node.get("class_type"), str)
+}
+missing_nodes = sorted(required_nodes.difference(object_info))
+if missing_nodes:
+    raise SystemExit(
+        "ComfyUI image is incompatible with this workflow; missing nodes: "
+        + ", ".join(missing_nodes)
+    )
 request = urllib.request.Request(base + "/prompt", data=payload, headers={"Content-Type": "application/json"})
 try:
     queued = read_json(request, 30)

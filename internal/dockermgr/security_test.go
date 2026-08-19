@@ -38,6 +38,7 @@ func TestValidateImageTrusted(t *testing.T) {
 	trusted := []string{
 		"ghcr.io/tokenize/example-worker:latest",
 		"ghcr.io/ai-dock/comfyui:latest",
+		"ghcr.io/clsferguson/comfyui-docker@sha256:b59dcaeece5585ac2040b76b40c1fd1b424f0c287fcaa2ebfb45af41a0b9f599",
 		"ghcr.io/invoke-ai/invokeai:latest",
 		"registry.hf.space/example-worker",
 		"jupyter/pytorch-notebook:latest",
@@ -60,6 +61,7 @@ func TestValidateImageUntrusted(t *testing.T) {
 		"randomuser/malicious-image:v1",
 		"quay.io/someone/something",
 		"gcr.io/attacker-project/backdoor",
+		"ghcr.io/clsferguson/comfyui-docker:latest",
 	}
 	for _, img := range untrusted {
 		if err := ValidateImage(img, policy); err == nil {

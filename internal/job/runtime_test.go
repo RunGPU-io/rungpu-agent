@@ -164,7 +164,8 @@ func TestComfyUIBatchMountsStagedPresetModels(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(modelsDir, "checkpoints"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	mounts, volumes, err := comfyUIBatchStorage(stagingDir)
+	layout := comfyUILayoutForImage("ghcr.io/ai-dock/comfyui:latest")
+	mounts, volumes, err := comfyUIBatchStorage(stagingDir, layout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,12 +180,39 @@ func TestComfyUIBatchMountsStagedPresetModels(t *testing.T) {
 }
 
 func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
-	_, volumes, err := comfyUIBatchStorage(t.TempDir())
+	_, volumes, err := comfyUIBatchStorage(t.TempDir(), comfyUILayoutForImage("ghcr.io/ai-dock/comfyui:latest"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(volumes) != len(comfyUIBatchVolumes) {
+	if len(volumes) != 3 {
 		t.Fatalf("default volumes = %v", volumes)
+	}
+}
+
+func TestModernComfyUIImageUsesCompatibleLayoutAndDirectEntrypoint(t *testing.T) {
+	image := modernComfyUIImagePrefix + "@sha256:b59dcaeece5585ac2040b76b40c1fd1b424f0c287fcaa2ebfb45af41a0b9f599"
+	layout := comfyUILayoutForImage(image)
+	if layout.root != "/app/ComfyUI" || layout.entrypoint != "python" {
+		t.Fatalf("modern layout = %+v", layout)
+	}
+	if strings.Join(layout.command, " ") != "main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch" {
+		t.Fatalf("modern command = %v", layout.command)
+	}
+	if layout.extraEnv["COMFY_AUTO_INSTALL"] != "0" || layout.supervised {
+		t.Fatalf("modern runtime must disable installs and supervisor: %+v", layout)
+	}
+
+	stagingDir := t.TempDir()
+	modelsDir := filepath.Join(stagingDir, "models")
+	if err := os.MkdirAll(modelsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mounts, volumes, err := comfyUIBatchStorage(stagingDir, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 1 || mounts[0] != modelsDir+":/app/ComfyUI/models:ro" || len(volumes) != 0 {
+		t.Fatalf("modern storage mounts=%v volumes=%v", mounts, volumes)
 	}
 }
 
@@ -202,6 +230,7 @@ func TestComfyUIRunnerRequiresCompleteAPIReadinessAndReportsEmptySubmission(t *t
 		`raise ValueError("empty response")`,
 		`last_error = type(error).__name__ + ": " + str(error)`,
 		`did not become ready after 300 seconds; last probe: `,
+		`ComfyUI image is incompatible with this workflow; missing nodes: `,
 		`workflow submission failed: `,
 		`workflow rejected: HTTP `,
 	} {

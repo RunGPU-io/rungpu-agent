@@ -27,8 +27,9 @@ import (
 // TrustedRegistries are the only registries we allow images from.
 // Images from other registries are rejected unless the host opts in.
 var TrustedRegistries = []string{
-	"ghcr.io/tokenize/",  // our pre-built model images
-	"ghcr.io/ai-dock/",   // ComfyUI, A1111 community images
+	"ghcr.io/tokenize/", // our pre-built model images
+	"ghcr.io/ai-dock/",  // ComfyUI, A1111 community images
+	"ghcr.io/clsferguson/comfyui-docker@sha256:b59dcaeece5585ac2040b76b40c1fd1b424f0c287fcaa2ebfb45af41a0b9f599", // pinned managed ComfyUI runtime
 	"ghcr.io/invoke-ai/", // InvokeAI
 	"registry.hf.space/", // HuggingFace Spaces
 	"docker.io/library/", // Docker Hub official images

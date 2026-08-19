@@ -26,17 +26,18 @@ func NewWithPolicy(policy SecurityPolicy) *Manager {
 
 // RunOptions configures a detached container run.
 type RunOptions struct {
-	Image     string
-	Name      string
-	Env       map[string]string
-	Mounts    []string // "hostPath:containerPath[:ro]" (bind mounts)
-	Volumes   []string // "namedVolume:containerPath" (Docker named volumes — persistent)
-	Ports     []string // "hostPort:containerPort"
-	Network   string   // required: "none" for batch jobs or "bridge" for workspaces
-	UseGPU    bool
-	GPUDevice string   // "" or "all" → all GPUs; else passed as --gpus device=<GPUDevice>
-	ShmSize   string   // shared memory size (e.g. "8g")
-	Command   []string // override CMD
+	Image      string
+	Name       string
+	Env        map[string]string
+	Mounts     []string // "hostPath:containerPath[:ro]" (bind mounts)
+	Volumes    []string // "namedVolume:containerPath" (Docker named volumes — persistent)
+	Ports      []string // "hostPort:containerPort"
+	Network    string   // required: "none" for batch jobs or "bridge" for workspaces
+	UseGPU     bool
+	GPUDevice  string   // "" or "all" → all GPUs; else passed as --gpus device=<GPUDevice>
+	ShmSize    string   // shared memory size (e.g. "8g")
+	Entrypoint string   // trusted runtime entrypoint override
+	Command    []string // override CMD
 }
 
 // Run starts a sandboxed detached container and returns its ID.
@@ -97,6 +98,9 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	}
 	for k, v := range opts.Env {
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+	}
+	if opts.Entrypoint != "" {
+		args = append(args, "--entrypoint", opts.Entrypoint)
 	}
 	args = append(args, opts.Image)
 	args = append(args, opts.Command...)
