@@ -3,6 +3,11 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.5] - 2026-08-19
+
+- Fixed model preparation on Windows when the verified model cache does not
+	permit timestamp updates.
+
 ## [1.3.4] - 2026-08-19
 
 - Tightened workload assignment validation and removed local runtime guessing.

@@ -244,6 +244,24 @@ func TestEnsureCachedFileDownloadsOnceConcurrently(t *testing.T) {
 	}
 }
 
+func TestEnsureCachedFileIgnoresTimestampRefreshFailure(t *testing.T) {
+	payload := []byte("verified model data")
+	expectedHash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	originalChtimes := cachedFileChtimes
+	cachedFileChtimes = func(string, time.Time, time.Time) error { return os.ErrPermission }
+	defer func() { cachedFileChtimes = originalChtimes }()
+
+	cachePath := filepath.Join(t.TempDir(), "asset.safetensors")
+	if err := ensureCachedFile(context.Background(), server.URL, cachePath, expectedHash); err != nil {
+		t.Fatalf("verified cache download failed on timestamp refresh: %v", err)
+	}
+}
+
 func TestVerifyFileSHA256RejectsChangedContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "asset.safetensors")
 	if err := os.WriteFile(path, []byte("changed"), 0o600); err != nil {

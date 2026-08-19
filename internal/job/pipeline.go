@@ -71,6 +71,8 @@ func hfToken() string {
 // progress to the WebSocket (and thus to the user's browser).
 type ProgressFunc func(stage string, progress float64, message string)
 
+var cachedFileChtimes = os.Chtimes
+
 func StageInlineWorkflow(workflow, expectedSHA256, stagingDir string) error {
 	data := []byte(workflow)
 	if len(data) == 0 || len(data) > 256*1024 || !json.Valid(data) {
@@ -326,7 +328,8 @@ func ensureCachedFileWithProgress(ctx context.Context, sourceURL, cachePath, exp
 		return err
 	}
 	now := time.Now()
-	return os.Chtimes(cachePath, now, now)
+	_ = cachedFileChtimes(cachePath, now, now)
+	return nil
 }
 
 func validSHA256(value string) bool {
