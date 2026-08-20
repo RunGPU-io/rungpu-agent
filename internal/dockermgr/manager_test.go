@@ -99,6 +99,24 @@ func TestBuildRunArgsComposition(t *testing.T) {
 	}
 }
 
+func TestBuildRunArgsManagedRuntimeCanUseHostMemory(t *testing.T) {
+	m := New()
+	limited := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "limited", Network: "none"})
+	if got := argValue(limited, "--memory"); got != "16g" {
+		t.Fatalf("default memory limit = %q, want 16g", got)
+	}
+
+	hostMemory := m.buildRunArgs(RunOptions{
+		Image: "ubuntu", Name: "managed", Network: "none", UseHostMemory: true,
+	})
+	if got := argValue(hostMemory, "--memory"); got != "" {
+		t.Fatalf("managed runtime memory limit = %q, want Docker host limit", got)
+	}
+	if !hasFlag(hostMemory, "--security-opt") || !hasFlag(hostMemory, "--pids-limit") {
+		t.Fatalf("managed runtime lost sandbox controls: %v", hostMemory)
+	}
+}
+
 func TestRunRejectsUnspecifiedNetwork(t *testing.T) {
 	_, err := New().Run(context.Background(), RunOptions{Image: "ubuntu", Name: "job-c"})
 	if err == nil || !strings.Contains(err.Error(), "network must be none or bridge") {

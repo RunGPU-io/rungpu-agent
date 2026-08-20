@@ -38,6 +38,10 @@ type RunOptions struct {
 	ShmSize    string   // shared memory size (e.g. "8g")
 	Entrypoint string   // trusted runtime entrypoint override
 	Command    []string // override CMD
+	// UseHostMemory removes the Docker memory cap for a trusted platform
+	// runtime. The Docker host/VM remains the hard limit. Never set this from
+	// renter-controlled input.
+	UseHostMemory bool
 }
 
 // Run starts a sandboxed detached container and returns its ID.
@@ -69,8 +73,15 @@ func (m *Manager) Run(ctx context.Context, opts RunOptions) (string, error) {
 func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	args := []string{"run", "-d", "--name", opts.Name}
 
-	// Sandbox args (always applied — renter cannot override)
-	args = append(args, SandboxArgs(m.Policy)...)
+	// Sandbox args (always applied — renter cannot override). Managed media
+	// decoding can temporarily need nearly all RAM exposed by Docker, so its
+	// trusted runtime may rely on the host/VM limit instead of a lower
+	// per-container cap.
+	policy := m.Policy
+	if opts.UseHostMemory {
+		policy.MaxMemoryGB = 0
+	}
+	args = append(args, SandboxArgs(policy)...)
 	args = append(args, "--network", opts.Network)
 
 	if opts.UseGPU {

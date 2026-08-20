@@ -129,6 +129,10 @@ func (r *comfyUIBatchRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		Network: "none",
 		Mounts:  mounts, Volumes: volumes, ShmSize: "8g",
 		Entrypoint: layout.entrypoint, Command: layout.command,
+		// This exact digest-pinned, coordinator-selected runtime may use all RAM
+		// exposed by Docker. Wan VAE loading can otherwise hit the agent's
+		// lower generic container cap and exit with SIGKILL (137).
+		UseHostMemory: !layout.supervised,
 		// ai-dock documents these settings in its docker-compose example, but
 		// they are not baked into the image config. In particular, WAN address
 		// discovery and quick tunnels cannot succeed under Network=none and may

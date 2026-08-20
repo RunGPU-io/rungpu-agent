@@ -3,6 +3,10 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.12] - 2026-08-19
+
+- Improved memory availability for managed generation workloads.
+
 ## [1.3.11] - 2026-08-19
 
 - Prevented long managed generation steps from failing on transient status
