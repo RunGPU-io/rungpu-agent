@@ -15,6 +15,7 @@ import (
 )
 
 const defaultOllamaEndpoint = "http://localhost:11434"
+const managedWarmTTL = "3m"
 
 type ollamaRuntime struct {
 	cacheDir string
@@ -214,10 +215,11 @@ func (r *ollamaRuntime) Run(ctx context.Context, a types.JobAssignment) (map[str
 	prompt := extractPrompt(a)
 
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":   model,
-		"prompt":  prompt,
-		"stream":  false,
-		"options": a.Parameters,
+		"model":      model,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": managedWarmTTL,
+		"options":    a.Parameters,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint+"/api/generate", bytes.NewReader(reqBody))
 	if err != nil {
