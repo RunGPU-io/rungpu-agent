@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,11 +27,15 @@ type comfyUILayout struct {
 
 func comfyUILayoutForImage(image string) comfyUILayout {
 	if strings.HasPrefix(strings.ToLower(image), modernComfyUIImagePrefix) {
+		root := "/app/ComfyUI"
 		return comfyUILayout{
-			root:       "/app/ComfyUI",
+			root:       root,
 			entrypoint: "python",
-			command:    []string{"main.py", "--listen", "127.0.0.1", "--port", "8188", "--disable-auto-launch"},
-			extraEnv:   map[string]string{"COMFY_AUTO_INSTALL": "0"},
+			command:    []string{"-c", comfyUIStartScript(root)},
+			extraEnv: map[string]string{
+				"COMFY_AUTO_INSTALL": "0",
+				"HF_HUB_OFFLINE":     "1",
+			},
 		}
 	}
 	return comfyUILayout{root: "/opt/ComfyUI", supervised: true}
@@ -338,6 +343,55 @@ func validateOutputFile(root, candidate string) (string, error) {
 		return "", fmt.Errorf("output is not a regular file")
 	}
 	return resolved, nil
+}
+
+const comfyUIStartScriptTemplate = `
+import os
+import pathlib
+import sys
+
+ROOT = __COMFYUI_ROOT__
+CUDA_CHECK_MARKER = "rungpu-cuda-compat"
+
+def patch_torchaudio_cuda_check():
+	roots = {pathlib.Path(sys.prefix), pathlib.Path("/usr/local")}
+	candidates = []
+	for root in roots:
+		candidates.extend(root.glob("lib/python*/site-packages/torchaudio/_extension/utils.py"))
+		candidates.extend(root.glob("lib/python*/dist-packages/torchaudio/_extension/utils.py"))
+	for path in candidates:
+		try:
+			text = path.read_text(encoding="utf-8")
+		except OSError:
+			continue
+		if "def _check_cuda_version(" not in text or CUDA_CHECK_MARKER in text:
+			continue
+		patched = text.replace(
+			"def _check_cuda_version(",
+			"def _check_cuda_version(*_a, **_k):\n    return None  # " + CUDA_CHECK_MARKER + "\n\ndef _original_check_cuda_version(",
+			1,
+		)
+		try:
+			path.write_text(patched, encoding="utf-8")
+		except OSError:
+			continue
+
+patch_torchaudio_cuda_check()
+os.chdir(ROOT)
+os.execv(sys.executable, [
+	sys.executable,
+	"main.py",
+	"--listen", "127.0.0.1",
+	"--port", "8188",
+	"--disable-auto-launch",
+	"--disable-all-custom-nodes",
+	"--disable-api-nodes",
+])
+`
+
+func comfyUIStartScript(root string) string {
+	script := strings.ReplaceAll(comfyUIStartScriptTemplate, "\t", "    ")
+	return strings.ReplaceAll(script, "__COMFYUI_ROOT__", strconv.Quote(root))
 }
 
 const comfyUIRunnerScript = `

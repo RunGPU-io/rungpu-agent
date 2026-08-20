@@ -195,10 +195,31 @@ func TestModernComfyUIImageUsesCompatibleLayoutAndDirectEntrypoint(t *testing.T)
 	if layout.root != "/app/ComfyUI" || layout.entrypoint != "python" {
 		t.Fatalf("modern layout = %+v", layout)
 	}
-	if strings.Join(layout.command, " ") != "main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch" {
+	if len(layout.command) != 2 || layout.command[0] != "-c" {
 		t.Fatalf("modern command = %v", layout.command)
 	}
-	if layout.extraEnv["COMFY_AUTO_INSTALL"] != "0" || layout.supervised {
+	start := layout.command[1]
+	if strings.ContainsRune(start, '\t') {
+		t.Fatal("ComfyUI start script contains tab indentation")
+	}
+	if output, err := exec.Command("python3", "-c", "compile(__import__('sys').argv[1], '<comfyui-start>', 'exec')", start).CombinedOutput(); err != nil {
+		t.Fatalf("ComfyUI start script is not valid Python: %s", output)
+	}
+	for _, required := range []string{
+		`ROOT = "/app/ComfyUI"`,
+		`CUDA_CHECK_MARKER = "rungpu-cuda-compat"`,
+		`def _check_cuda_version(*_a, **_k):`,
+		`return None  # " + CUDA_CHECK_MARKER`,
+		`"--disable-all-custom-nodes"`,
+		`"--disable-api-nodes"`,
+		`"--listen", "127.0.0.1"`,
+		`"--port", "8188"`,
+	} {
+		if !strings.Contains(start, required) {
+			t.Fatalf("ComfyUI start script is missing %q", required)
+		}
+	}
+	if layout.extraEnv["COMFY_AUTO_INSTALL"] != "0" || layout.extraEnv["HF_HUB_OFFLINE"] != "1" || layout.supervised {
 		t.Fatalf("modern runtime must disable installs and supervisor: %+v", layout)
 	}
 
@@ -213,6 +234,32 @@ func TestModernComfyUIImageUsesCompatibleLayoutAndDirectEntrypoint(t *testing.T)
 	}
 	if len(mounts) != 1 || mounts[0] != modelsDir+":/app/ComfyUI/models:ro" || len(volumes) != 0 {
 		t.Fatalf("modern storage mounts=%v volumes=%v", mounts, volumes)
+	}
+}
+
+func TestComfyUIStartScriptNeutralizesTorchAudioCudaCheck(t *testing.T) {
+	utils := filepath.Join(t.TempDir(), "utils.py")
+	original := "def _check_cuda_version():\n    raise RuntimeError('cuda mismatch')\n"
+	if err := os.WriteFile(utils, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := `
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+patched = text.replace(
+    "def _check_cuda_version(",
+    "def _check_cuda_version(*_a, **_k):\n    return None  # rungpu-cuda-compat\n\ndef _original_check_cuda_version(",
+    1,
+)
+path.write_text(patched)
+ns = {}
+exec(compile(path.read_text(), str(path), "exec"), ns)
+assert ns["_check_cuda_version"]() is None
+`
+	if output, err := exec.Command("python3", "-c", script, utils).CombinedOutput(); err != nil {
+		t.Fatalf("cuda check patch failed: %s", output)
 	}
 }
 
