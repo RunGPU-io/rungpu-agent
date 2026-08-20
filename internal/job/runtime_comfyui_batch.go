@@ -445,8 +445,15 @@ except Exception as error:
 prompt_id = queued.get("prompt_id")
 if not prompt_id:
     raise SystemExit("workflow rejected: " + json.dumps(queued))
-for _ in range(3600):
-	history = read_json(base + "/history/" + prompt_id, 10)
+history_deadline = time.monotonic() + 3600
+last_history_error = "no history response received"
+while time.monotonic() < history_deadline:
+    try:
+		history = read_json(base + "/history/" + prompt_id, 10)
+    except Exception as error:
+		last_history_error = type(error).__name__ + ": " + str(error)
+        time.sleep(1)
+        continue
     item = history.get(prompt_id)
     if item:
         status = item.get("status", {})
@@ -461,7 +468,7 @@ for _ in range(3600):
         if status.get("completed"):
             raise SystemExit("workflow completed without media output")
     time.sleep(1)
-raise SystemExit("workflow timed out")
+raise SystemExit("workflow timed out; last history probe: " + last_history_error)
 `
 
 func comfyUIRunner() string {

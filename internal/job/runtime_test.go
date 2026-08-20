@@ -280,10 +280,60 @@ func TestComfyUIRunnerRequiresCompleteAPIReadinessAndReportsEmptySubmission(t *t
 		`ComfyUI image is incompatible with this workflow; missing nodes: `,
 		`workflow submission failed: `,
 		`workflow rejected: HTTP `,
+		`history_deadline = time.monotonic() + 3600`,
+		`last_history_error = type(error).__name__ + ": " + str(error)`,
+		`workflow timed out; last history probe: `,
 	} {
 		if !strings.Contains(runner, required) {
 			t.Fatalf("ComfyUI runner is missing %q", required)
 		}
+	}
+}
+
+func TestComfyUIRunnerRetriesTransientHistoryFailure(t *testing.T) {
+	historyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/system_stats":
+			_, _ = w.Write([]byte(`{}`))
+		case "/object_info":
+			_, _ = w.Write([]byte(`{"KSampler":{}}`))
+		case "/prompt":
+			_, _ = w.Write([]byte(`{"prompt_id":"prompt-1"}`))
+		case "/history/prompt-1":
+			historyCalls++
+			if historyCalls == 1 {
+				_, _ = w.Write([]byte(`{`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"prompt-1":{"outputs":{"9":{"videos":[{"filename":"result.mp4","subfolder":"","type":"output"}]}}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	requestPath := filepath.Join(t.TempDir(), "request.json")
+	request := `{"prompt":{"1":{"class_type":"KSampler","inputs":{}}},"client_id":"test"}`
+	if err := os.WriteFile(requestPath, []byte(request), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := strings.Replace(
+		comfyUIRunner(),
+		`base = "http://127.0.0.1:8188"`,
+		`base = "`+server.URL+`"`,
+		1,
+	)
+	output, err := exec.Command("python3", "-c", runner, requestPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("runner failed after transient history error: %v: %s", err, output)
+	}
+	if historyCalls < 2 {
+		t.Fatalf("history calls = %d, want at least 2", historyCalls)
+	}
+	if !strings.Contains(string(output), `"filename": "result.mp4"`) {
+		t.Fatalf("runner output = %s", output)
 	}
 }
 
