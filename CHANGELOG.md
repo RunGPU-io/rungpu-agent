@@ -3,6 +3,11 @@
 User-visible changes to the RunGPU Agent. Internal platform implementation and
 security details are intentionally excluded.
 
+## [1.3.14] - 2026-08-20
+
+- Added support for managed text-to-speech workloads, including optional
+  reference-voice cloning.
+
 ## [1.3.12] - 2026-08-19
 
 - Improved memory availability for managed generation workloads.

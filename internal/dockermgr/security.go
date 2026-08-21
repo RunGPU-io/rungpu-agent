@@ -28,8 +28,10 @@ import (
 // Images from other registries are rejected unless the host opts in.
 var TrustedRegistries = []string{
 	"ghcr.io/tokenize/", // our pre-built model images
+	"ghcr.io/remsky/kokoro-fastapi-gpu", // managed Kokoro-FastAPI GPU runtime (not the whole remsky org)
+	"docker.io/bhimrazy/chatterbox-tts", // managed Chatterbox LitServe GPU runtime (not the whole bhimrazy namespace)
 	"ghcr.io/ai-dock/",  // ComfyUI, A1111 community images
-	"ghcr.io/clsferguson/comfyui-docker@sha256:b59dcaeece5585ac2040b76b40c1fd1b424f0c287fcaa2ebfb45af41a0b9f599", // pinned managed ComfyUI runtime
+	"ghcr.io/clsferguson/comfyui-docker@sha256:838ad84cf36ec483998be48aa96ad8889beb761c535be00762ebe42ed2620a0b", // pinned managed ComfyUI runtime v0.28.0
 	"ghcr.io/invoke-ai/", // InvokeAI
 	"registry.hf.space/", // HuggingFace Spaces
 	"docker.io/library/", // Docker Hub official images
@@ -110,7 +112,7 @@ func ValidateImage(image string, policy SecurityPolicy) error {
 
 	allTrusted := append(TrustedRegistries, policy.TrustedRegistries...)
 	for _, prefix := range allTrusted {
-		if strings.HasPrefix(normalized, prefix) || strings.HasPrefix(image, prefix) {
+		if imageMatchesTrusted(normalized, prefix) || imageMatchesTrusted(image, prefix) {
 			return nil
 		}
 	}
@@ -120,6 +122,19 @@ func ValidateImage(image string, policy SecurityPolicy) error {
 			"Host can set allow_any_image: true in config to override",
 		image, strings.Join(allTrusted, ", "),
 	)
+}
+
+// imageMatchesTrusted reports whether image is covered by a trusted entry.
+// Registry prefixes end with "/". Digest pins contain "@sha256:". Bare image
+// names must match exactly or be followed by a tag (":") or digest ("@").
+func imageMatchesTrusted(image, trusted string) bool {
+	if trusted == "" {
+		return false
+	}
+	if strings.HasSuffix(trusted, "/") || strings.Contains(trusted, "@sha256:") {
+		return strings.HasPrefix(image, trusted)
+	}
+	return image == trusted || strings.HasPrefix(image, trusted+":") || strings.HasPrefix(image, trusted+"@")
 }
 
 // ValidateMounts checks that no mount path accesses sensitive host directories.

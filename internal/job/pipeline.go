@@ -131,6 +131,7 @@ var SafeFileExtensions = []string{
 	".safetensors",                    // model weights without executable pickle payloads
 	".json", ".yaml", ".yml", ".toml", // configs, workflows
 	".png", ".jpg", ".jpeg", ".webp", // reference images
+	".wav", ".mp3",                   // reference audio
 	".txt", ".csv", // prompts, metadata
 }
 

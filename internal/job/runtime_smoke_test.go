@@ -27,7 +27,7 @@ func requireRuntimeSmoke(t *testing.T) {
 func TestRuntimeSmoke_NativeOllamaInference(t *testing.T) {
 	requireRuntimeSmoke(t)
 
-	runtime := newOllamaRuntime(t.TempDir())
+	runtime := newOllamaRuntime(t.TempDir(), "")
 	prepareContext, cancelPrepare := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancelPrepare()
 	if err := runtime.Prepare(prepareContext, types.JobAssignment{ModelName: runtimeSmokeModel}); err != nil {

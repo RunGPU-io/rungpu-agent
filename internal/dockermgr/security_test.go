@@ -37,8 +37,12 @@ func TestValidateImageTrusted(t *testing.T) {
 	// Trusted registries should pass
 	trusted := []string{
 		"ghcr.io/tokenize/example-worker:latest",
+		"ghcr.io/remsky/kokoro-fastapi-gpu:v0.8.0",
+		"ghcr.io/remsky/kokoro-fastapi-gpu:latest-cu128",
+		"bhimrazy/chatterbox-tts:v0.1.0",
+		"docker.io/bhimrazy/chatterbox-tts:v0.1.0",
 		"ghcr.io/ai-dock/comfyui:latest",
-		"ghcr.io/clsferguson/comfyui-docker@sha256:b59dcaeece5585ac2040b76b40c1fd1b424f0c287fcaa2ebfb45af41a0b9f599",
+		"ghcr.io/clsferguson/comfyui-docker@sha256:838ad84cf36ec483998be48aa96ad8889beb761c535be00762ebe42ed2620a0b",
 		"ghcr.io/invoke-ai/invokeai:latest",
 		"registry.hf.space/example-worker",
 		"jupyter/pytorch-notebook:latest",
@@ -62,6 +66,11 @@ func TestValidateImageUntrusted(t *testing.T) {
 		"quay.io/someone/something",
 		"gcr.io/attacker-project/backdoor",
 		"ghcr.io/clsferguson/comfyui-docker:latest",
+		"ghcr.io/remsky/unrelated:latest",
+		"ghcr.io/remsky/kokoro-fastapi-cpu:latest",
+		"ghcr.io/remsky/kokoro-fastapi-gpu-evil:latest",
+		"bhimrazy/unrelated:latest",
+		"bhimrazy/chatterbox-tts-evil:latest",
 	}
 	for _, img := range untrusted {
 		if err := ValidateImage(img, policy); err == nil {

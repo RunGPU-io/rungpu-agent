@@ -193,9 +193,15 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 
 	res.Success = true
 	if out != nil {
+		if e.backend != "" {
+			out["backend"] = e.backend
+		}
 		res.Result = out
 	} else {
 		res.Result = map[string]interface{}{"status": "completed"}
+		if e.backend != "" {
+			res.Result["backend"] = e.backend
+		}
 	}
 	return res
 }

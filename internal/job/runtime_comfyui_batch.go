@@ -254,7 +254,12 @@ func comfyUIBatchStorage(stagingDir string, layout comfyUILayout) ([]string, []s
 			"tokenize-comfyui-input:" + layout.root + "/input",
 		}
 	}
-	return []string{modelsDir + ":" + layout.root + "/models:ro"}, volumes, nil
+	mounts := []string{modelsDir + ":" + layout.root + "/models:ro"}
+	inputDir := filepath.Join(stagingDir, "input")
+	if info, err := os.Stat(inputDir); err == nil && info.IsDir() {
+		mounts = append(mounts, inputDir+":"+layout.root+"/input:ro")
+	}
+	return mounts, volumes, nil
 }
 
 func (r *comfyUIBatchRuntime) workflowPath(a types.JobAssignment) (string, error) {

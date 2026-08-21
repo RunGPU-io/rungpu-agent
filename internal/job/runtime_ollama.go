@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	rt "runtime"
+	"strings"
 	"time"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
@@ -24,10 +25,17 @@ type ollamaRuntime struct {
 	client   *http.Client
 }
 
-func newOllamaRuntime(cacheDir string) *ollamaRuntime {
-	backend := "cpu"
-	if rt.GOOS == "darwin" && rt.GOARCH == "arm64" {
-		backend = "metal"
+func newOllamaRuntime(cacheDir, hostBackend string) *ollamaRuntime {
+	backend := strings.ToLower(strings.TrimSpace(hostBackend))
+	switch backend {
+	case "cuda", "metal", "cpu":
+	default:
+		backend = "cpu"
+		if rt.GOOS == "darwin" && rt.GOARCH == "arm64" {
+			backend = "metal"
+		} else if _, err := exec.LookPath("nvidia-smi"); err == nil {
+			backend = "cuda"
+		}
 	}
 	return &ollamaRuntime{
 		cacheDir: cacheDir,

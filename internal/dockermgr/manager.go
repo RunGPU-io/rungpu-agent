@@ -118,6 +118,19 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	return args
 }
 
+// Exec runs a command inside a running container and returns combined output.
+func (m *Manager) Exec(ctx context.Context, name string, command []string) (string, error) {
+	if strings.TrimSpace(name) == "" || len(command) == 0 {
+		return "", fmt.Errorf("docker exec requires a container name and command")
+	}
+	args := append([]string{"exec", name}, command...)
+	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("docker exec failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
 // Logs returns up to `tail` lines of a container's combined output.
 func (m *Manager) Logs(ctx context.Context, name string, tail int) (string, error) {
 	out, err := exec.CommandContext(ctx, "docker", "logs", "--tail", strconv.Itoa(tail), name).CombinedOutput()
@@ -254,6 +267,8 @@ func (m *Manager) ListTokenizeImages(ctx context.Context) ([]ImageInfo, error) {
 	knownPrefixes := []string{
 		"ghcr.io/ai-dock/",
 		"ghcr.io/tokenize/",
+		"ghcr.io/remsky/kokoro-fastapi-gpu",
+		"bhimrazy/chatterbox-tts",
 		"ghcr.io/invoke-ai/",
 		"registry.hf.space/",
 		"jupyter/pytorch-notebook",

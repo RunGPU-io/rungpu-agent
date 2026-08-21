@@ -138,6 +138,19 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		_ = r.docker.Remove(context.Background(), containerName)
 	}()
 
+	if isKokoroFastAPIImage(img) || isChatterboxLitServeImage(img) {
+		var speechErr error
+		if isKokoroFastAPIImage(img) {
+			speechErr = r.driveKokoroFastAPI(ctx, containerName, outputDir, r.jobTimeoutFor(a))
+		} else {
+			speechErr = r.driveChatterboxLitServe(ctx, containerName, outputDir, r.jobTimeoutFor(a))
+		}
+		if speechErr != nil {
+			return nil, speechErr
+		}
+		return r.collectSpeechOutput(img, outputDir)
+	}
+
 	output, exitCode, waitErr := r.waitForCompletion(ctx, containerName, r.jobTimeoutFor(a))
 	if waitErr != nil {
 		return nil, waitErr

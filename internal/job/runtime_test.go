@@ -190,7 +190,7 @@ func TestComfyUIBatchKeepsModelVolumeWithoutPresetModels(t *testing.T) {
 }
 
 func TestModernComfyUIImageUsesCompatibleLayoutAndDirectEntrypoint(t *testing.T) {
-	image := modernComfyUIImagePrefix + "@sha256:b59dcaeece5585ac2040b76b40c1fd1b424f0c287fcaa2ebfb45af41a0b9f599"
+	image := modernComfyUIImagePrefix + "@sha256:838ad84cf36ec483998be48aa96ad8889beb761c535be00762ebe42ed2620a0b"
 	layout := comfyUILayoutForImage(image)
 	if layout.root != "/app/ComfyUI" || layout.entrypoint != "python" {
 		t.Fatalf("modern layout = %+v", layout)
@@ -566,6 +566,32 @@ func TestExecutorEndToEnd(t *testing.T) {
 		t.Errorf("response = %v", result.Result["response"])
 	}
 	t.Logf("E2E: success=%v duration=%dms response=%v", result.Success, result.DurationMS, result.Result["response"])
+}
+
+func TestExecutorReportsHostBackend(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"model": "llama3", "response": "ok", "done": true, "eval_count": 1,
+		})
+	}))
+	defer srv.Close()
+
+	mockRT := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 10 * time.Second},
+	}
+	exec := &Executor{runtime: &skipPrepare{inner: mockRT}, gpuID: "gpu-e2e", backend: "cuda"}
+
+	result := exec.Execute(context.Background(), types.JobAssignment{
+		JobID: "backend-1", ModelName: "llama3",
+		Input: map[string]interface{}{"prompt": "hi"},
+	})
+	if !result.Success {
+		t.Fatalf("failed: %s", result.Error)
+	}
+	if result.Result["backend"] != "cuda" {
+		t.Errorf("backend = %v, want cuda from the host executor not ollama's cpu default", result.Result["backend"])
+	}
 }
 
 func TestExecutorHandlesFailure(t *testing.T) {

@@ -43,7 +43,7 @@ func NewRuntimeOpts(backend, cacheDir string, maxCacheGB int, options RuntimeOpt
 	useGPU := strings.EqualFold(backend, "cuda")
 	runtime := &multiRuntime{hasOllama: hasOllama, hasDocker: hasDocker}
 	if hasOllama {
-		runtime.ollama = newOllamaRuntime(cacheDir)
+		runtime.ollama = newOllamaRuntime(cacheDir, backend)
 	}
 	if hasDocker {
 		runtime.dockerCustom = newCustomDockerRuntime(cacheDir, useGPU, options.GPUDevice, options.JobTimeout, options.Policy)
