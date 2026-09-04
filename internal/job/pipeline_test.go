@@ -1,0 +1,532 @@
+package job
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
+)
+
+func TestMain(m *testing.M) {
+	allowInsecureLoopbackForTests = true
+	TrustedUploadHosts = append(TrustedUploadHosts, "127.0.0.1", "::1")
+	os.Exit(m.Run())
+}
+
+func TestResolveImage(t *testing.T) {
+	cases := []struct {
+		name    string
+		job     types.JobAssignment
+		want    string
+		wantErr bool
+	}{
+		{
+			"explicit DockerImage field",
+			types.JobAssignment{DockerImage: "myregistry/mymodel:v1"},
+			"myregistry/mymodel:v1", false,
+		},
+		{
+			"docker_image in parameters",
+			types.JobAssignment{Parameters: map[string]interface{}{"docker_image": "img:v2"}},
+			"img:v2", false,
+		},
+		{
+			"named workload requires explicit worker",
+			types.JobAssignment{ModelName: "managed-media"},
+			"", true,
+		},
+		{
+			"HuggingFace URL requires explicit worker",
+			types.JobAssignment{ModelName: "test", ModelURL: "https://huggingface.co/spaces/org/model"},
+			"", true,
+		},
+		{
+			"repository style identifier requires explicit worker",
+			types.JobAssignment{ModelName: "organization/model"},
+			"", true,
+		},
+		{
+			"unknown model no slash",
+			types.JobAssignment{ModelName: "unknownmodel"},
+			"", true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveImage(tc.job)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateCustomFileURL(t *testing.T) {
+
+	trusted := []struct{ url, path string }{
+		{"https://huggingface.co/user/model/resolve/main/lora.safetensors", "models/loras/lora.safetensors"},
+		{"https://raw.githubusercontent.com/user/repo/main/workflow.json", "workflows/wf.json"},
+		{"https://storage.googleapis.com/bucket/model.safetensors", "models/model.safetensors"},
+		{"https://cdn-lfs.huggingface.co/repos/abc/model.safetensors", "models/m.safetensors"},
+		{"https://example.com/weights.safetensors", "models/m.safetensors"},
+	}
+	for _, tc := range trusted {
+		if err := ValidateCustomFileURL(tc.url, tc.path); err != nil {
+			t.Errorf("trusted URL %q rejected: %v", tc.url, err)
+		}
+	}
+
+	untrusted := []struct{ url, path string }{
+		{"http://huggingface.co/model.safetensors", "models/m.safetensors"},
+		{"ftp://huggingface.co/model.safetensors", "models/m.safetensors"},
+	}
+	for _, tc := range untrusted {
+		if err := ValidateCustomFileURL(tc.url, tc.path); err == nil {
+			t.Errorf("untrusted URL %q should be rejected", tc.url)
+		}
+	}
+
+	if err := ValidateCustomFileURL("https://huggingface.co/file.exe", "models/file.exe"); err == nil {
+		t.Error(".exe should be rejected")
+	}
+	if err := ValidateCustomFileURL("https://huggingface.co/file.sh", "scripts/file.sh"); err == nil {
+		t.Error(".sh should be rejected")
+	}
+	for _, unsafe := range []string{"model.ckpt", "model.pt", "model.pth", "model.bin", "model.pkl"} {
+		if err := ValidateCustomFileURL("https://huggingface.co/"+unsafe, "models/"+unsafe); err == nil {
+			t.Errorf("%s should be rejected as an unsafe model format", unsafe)
+		}
+	}
+
+	if err := ValidateCustomFileURL("https://huggingface.co/lora.safetensors", "../../etc/passwd"); err == nil {
+		t.Error("path traversal should be rejected")
+	}
+}
+
+func TestDownloadCustomFilesDirectly(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/lora.safetensors":
+			w.Write([]byte("fake lora weights"))
+		case "/workflow.json":
+			w.Write([]byte(`{"nodes": []}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+
+	stagingDir := t.TempDir()
+
+	loraPath := filepath.Join(stagingDir, "models/loras/my_lora.safetensors")
+	os.MkdirAll(filepath.Dir(loraPath), 0755)
+	if err := downloadFile(context.Background(), srv.URL+"/lora.safetensors", loraPath); err != nil {
+		t.Fatalf("download lora: %v", err)
+	}
+	if data, err := os.ReadFile(loraPath); err != nil {
+		t.Errorf("lora missing: %v", err)
+	} else if string(data) != "fake lora weights" {
+		t.Errorf("lora content = %q", string(data))
+	}
+
+	wfPath := filepath.Join(stagingDir, "workflows/my_workflow.json")
+	os.MkdirAll(filepath.Dir(wfPath), 0755)
+	if err := downloadFile(context.Background(), srv.URL+"/workflow.json", wfPath); err != nil {
+		t.Fatalf("download workflow: %v", err)
+	}
+	if data, err := os.ReadFile(wfPath); err != nil {
+		t.Errorf("workflow missing: %v", err)
+	} else if string(data) != `{"nodes": []}` {
+		t.Errorf("workflow content = %q", string(data))
+	}
+
+	if err := downloadFile(context.Background(), srv.URL+"/lora.safetensors", loraPath); err != nil {
+		t.Fatalf("re-download: %v", err)
+	}
+}
+
+func TestDownloadCustomFilesEmpty(t *testing.T) {
+	err := DownloadCustomFiles(context.Background(), nil, t.TempDir(), nil)
+	if err != nil {
+		t.Errorf("empty files should not error: %v", err)
+	}
+}
+
+func TestDownloadFileReportsByteProgress(t *testing.T) {
+	content := bytes.Repeat([]byte("x"), 2*1024*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		for offset := 0; offset < len(content); offset += 64 * 1024 {
+			end := offset + 64*1024
+			if end > len(content) {
+				end = len(content)
+			}
+			_, _ = w.Write(content[offset:end])
+		}
+	}))
+	defer server.Close()
+
+	var fractions []float64
+	err := downloadFileWithProgress(context.Background(), server.URL, filepath.Join(t.TempDir(), "model.safetensors"), func(downloaded, total int64) {
+		fractions = append(fractions, float64(downloaded)/float64(total))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fractions) < 2 || fractions[0] <= 0 || fractions[0] >= 1 || fractions[len(fractions)-1] != 1 {
+		t.Fatalf("byte progress = %v, want intermediate updates ending at 1", fractions)
+	}
+}
+
+func TestEnsureCachedFileDownloadsOnceConcurrently(t *testing.T) {
+	content := []byte("shared asset")
+	expectedSHA256 := fmt.Sprintf("%x", sha256.Sum256(content))
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		_, _ = w.Write(content)
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "asset.safetensors")
+	var workers sync.WaitGroup
+	errors := make(chan error, 8)
+	for index := 0; index < 8; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			errors <- ensureCachedFile(context.Background(), server.URL, cachePath, expectedSHA256)
+		}()
+	}
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("network requests=%d, want 1", got)
+	}
+}
+
+func TestEnsureCachedFileIgnoresTimestampRefreshFailure(t *testing.T) {
+	payload := []byte("verified model data")
+	expectedHash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	originalChtimes := cachedFileChtimes
+	cachedFileChtimes = func(string, time.Time, time.Time) error { return os.ErrPermission }
+	defer func() { cachedFileChtimes = originalChtimes }()
+
+	cachePath := filepath.Join(t.TempDir(), "asset.safetensors")
+	if err := ensureCachedFile(context.Background(), server.URL, cachePath, expectedHash); err != nil {
+		t.Fatalf("verified cache download failed on timestamp refresh: %v", err)
+	}
+}
+
+func TestVerifyFileSHA256RejectsChangedContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "asset.safetensors")
+	if err := os.WriteFile(path, []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := fmt.Sprintf("%x", sha256.Sum256([]byte("expected")))
+	if err := verifyFileSHA256(path, expected); err == nil {
+		t.Fatal("expected changed content to fail SHA-256 verification")
+	}
+}
+
+func TestUploadOutput(t *testing.T) {
+	var receivedBody []byte
+	var receivedContentType string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "want PUT", 405)
+			return
+		}
+		receivedContentType = r.Header.Get("Content-Type")
+		body, _ := os.ReadFile(r.URL.Path)
+		_ = body
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		receivedBody = buf[:n]
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	tmpFile := filepath.Join(t.TempDir(), "output.mp4")
+	os.WriteFile(tmpFile, []byte("fake video data"), 0644)
+
+	err := UploadOutput(context.Background(), tmpFile, srv.URL+"/upload")
+	if err != nil {
+		t.Fatalf("UploadOutput: %v", err)
+	}
+
+	if string(receivedBody) != "fake video data" {
+		t.Errorf("received body = %q", string(receivedBody))
+	}
+	if receivedContentType != "video/mp4" {
+		t.Errorf("content-type = %q, want video/mp4", receivedContentType)
+	}
+}
+
+func TestUploadOutputEmptyURL(t *testing.T) {
+
+	err := UploadOutput(context.Background(), "/nonexistent", "")
+	if err != nil {
+		t.Errorf("empty URL should be no-op: %v", err)
+	}
+}
+
+func TestBuildMounts(t *testing.T) {
+	mounts := BuildMounts("/cache", "/staging/job1", []types.CustomFile{
+		{URL: "x", Path: "models/lora.safetensors"},
+	})
+
+	if len(mounts) != 2 {
+		t.Fatalf("expected 2 mounts, got %d: %v", len(mounts), mounts)
+	}
+	if mounts[0] != "/cache:/cache" {
+		t.Errorf("mount[0] = %q", mounts[0])
+	}
+	if mounts[1] != "/staging/job1:/custom:ro" {
+		t.Errorf("mount[1] = %q", mounts[1])
+	}
+
+	mounts2 := BuildMounts("/cache", "", nil)
+	if len(mounts2) != 1 {
+		t.Errorf("expected 1 mount without custom files, got %d", len(mounts2))
+	}
+}
+
+func TestFindOutputFile(t *testing.T) {
+	dir := t.TempDir()
+
+	if f := findOutputFile(dir); f != "" {
+		t.Errorf("empty dir should return empty, got %q", f)
+	}
+
+	os.WriteFile(filepath.Join(dir, "log.txt"), []byte("log"), 0644)
+	if f := findOutputFile(dir); f != filepath.Join(dir, "log.txt") {
+
+		t.Logf("fallback file: %q", f)
+	}
+
+	os.WriteFile(filepath.Join(dir, "output.mp4"), []byte("video"), 0644)
+	f := findOutputFile(dir)
+	if f != filepath.Join(dir, "output.mp4") {
+		t.Errorf("should find mp4, got %q", f)
+	}
+
+	dir2 := t.TempDir()
+	os.WriteFile(filepath.Join(dir2, "result.png"), []byte("image"), 0644)
+	if f := findOutputFile(dir2); f != filepath.Join(dir2, "result.png") {
+		t.Errorf("should find png, got %q", f)
+	}
+}
+
+func TestDownloadFileWithHFToken(t *testing.T) {
+	var receivedAuth string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Write([]byte("model weights"))
+	}))
+	defer srv.Close()
+
+	os.Setenv("HF_TOKEN", "hf_test_token_123")
+	defer os.Unsetenv("HF_TOKEN")
+
+	dest := filepath.Join(t.TempDir(), "model.safetensors")
+
+	err := downloadFile(context.Background(), srv.URL+"/huggingface.co/model.safetensors", dest)
+	if err != nil {
+		t.Fatalf("download error: %v", err)
+	}
+
+	if receivedAuth != "Bearer hf_test_token_123" {
+		t.Errorf("Authorization = %q, want 'Bearer hf_test_token_123'", receivedAuth)
+	}
+
+	data, _ := os.ReadFile(dest)
+	if string(data) != "model weights" {
+		t.Errorf("content = %q", string(data))
+	}
+}
+
+func TestDownloadFileNoTokenForNonHF(t *testing.T) {
+	var receivedAuth string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Write([]byte("data"))
+	}))
+	defer srv.Close()
+
+	os.Setenv("HF_TOKEN", "hf_should_not_be_sent")
+	defer os.Unsetenv("HF_TOKEN")
+
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	err := downloadFile(context.Background(), srv.URL+"/civitai/model.safetensors", dest)
+	if err != nil {
+		t.Fatalf("download error: %v", err)
+	}
+
+	if receivedAuth != "" {
+		t.Errorf("non-HF URL should not get auth header, got %q", receivedAuth)
+	}
+}
+
+func TestDownloadFileGatedModelError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Access denied", 403)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "gated.safetensors")
+	err := downloadFile(context.Background(), srv.URL+"/huggingface.co/gated-model", dest)
+
+	if err == nil {
+		t.Fatal("expected error for 403")
+	}
+	if !strings.Contains(err.Error(), "gated") {
+		t.Errorf("error should mention 'gated': %v", err)
+	}
+	if !strings.Contains(err.Error(), "HF_TOKEN") {
+		t.Errorf("error should mention HF_TOKEN: %v", err)
+	}
+}
+
+func TestExecutorRejectsUntrustedCustomFileURL(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"model": "llama2", "response": "done", "done": true, "eval_count": 1,
+		})
+	}))
+	defer ollamaSrv.Close()
+
+	cacheDir := t.TempDir()
+	mockRT := &ollamaRuntime{
+		cacheDir: cacheDir, endpoint: ollamaSrv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 10 * time.Second},
+	}
+	exec := &Executor{
+		runtime:  &skipPrepare{inner: mockRT},
+		gpuID:    "gpu-sec",
+		backend:  "cpu",
+		cacheDir: cacheDir,
+	}
+
+	result := exec.Execute(context.Background(), types.JobAssignment{
+		JobID:     "sec-1",
+		ModelName: "llama2",
+		Input:     map[string]interface{}{"prompt": "test"},
+		CustomFiles: []types.CustomFile{
+			{URL: "http://evil.io/malware.safetensors", Path: "models/loras/bad.safetensors", Name: "Bad LoRA", SHA256: strings.Repeat("a", 64)},
+		},
+	})
+
+	if result.Success {
+		t.Fatal("should have failed — non-HTTPS URL")
+	}
+	if !strings.Contains(result.Error, "HTTPS") {
+		t.Errorf("error should mention HTTPS: %s", result.Error)
+	}
+}
+
+func TestPruneCustomAssetsUsesTTLAndLRU(t *testing.T) {
+	cacheDir := t.TempDir()
+	now := time.Now()
+	old := now.Add(-8 * 24 * time.Hour)
+	middle := now.Add(-2 * time.Hour)
+	recent := now.Add(-time.Hour)
+
+	oldAsset := filepath.Join(cacheDir, "assets", "old.safetensors")
+	middleAsset := filepath.Join(cacheDir, "assets", "middle.safetensors")
+	recentAsset := filepath.Join(cacheDir, "assets", "recent.safetensors")
+	for _, path := range []string{oldAsset, middleAsset, recentAsset} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("asset"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, modified := range map[string]time.Time{oldAsset: old, middleAsset: middle, recentAsset: recent} {
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files, bytes, err := PruneCustomAssets(cacheDir, 7*24*time.Hour, 5, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files != 2 || bytes != 10 {
+		t.Fatalf("removed files=%d bytes=%d, want 2 and 10", files, bytes)
+	}
+	for _, path := range []string{oldAsset, middleAsset} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expired path still exists: %s", path)
+		}
+	}
+	for _, path := range []string{recentAsset} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("recent path was removed: %s: %v", path, err)
+		}
+	}
+}
+
+func TestExecutorRejectsPathTraversal(t *testing.T) {
+	cacheDir := t.TempDir()
+	exec := &Executor{
+		runtime:  &skipPrepare{inner: &ollamaRuntime{cacheDir: cacheDir, endpoint: "http://localhost:1", backend: "cpu", client: &http.Client{}}},
+		gpuID:    "gpu-pt",
+		backend:  "cpu",
+		cacheDir: cacheDir,
+	}
+
+	result := exec.Execute(context.Background(), types.JobAssignment{
+		JobID:     "pt-1",
+		ModelName: "llama2",
+		Input:     map[string]interface{}{"prompt": "test"},
+		CustomFiles: []types.CustomFile{
+			{URL: "https://huggingface.co/lora.safetensors", Path: "../../etc/passwd", Name: "Traversal"},
+		},
+	})
+
+	if result.Success {
+		t.Fatal("should have failed — path traversal")
+	}
+	if !strings.Contains(result.Error, "path traversal") {
+		t.Errorf("error should mention path traversal: %s", result.Error)
+	}
+}

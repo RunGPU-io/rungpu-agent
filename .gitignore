@@ -1,0 +1,23 @@
+# Compiled binaries
+/tokenize-gpu-agent
+/tokenize-gpu-agent.exe
+/rungpu-agent
+/rungpu-agent.exe
+/gpu-agent
+/gpu-agent.exe
+
+# Cross-compiled output
+/dist/
+
+# Test coverage
+/coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

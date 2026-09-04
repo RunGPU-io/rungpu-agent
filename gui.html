@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RunGPU Agent</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --card: #121a2b;
+      --border: #243049;
+      --text: #e8eefc;
+      --muted: #93a0b8;
+      --accent: #3dff8a;
+      --warn: #ffc857;
+      --danger: #ff6b7a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { display: flex; flex-direction: column; padding: 20px; gap: 14px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .status { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
+    .status strong { display: block; font-size: 16px; margin-bottom: 4px; }
+    .status.earning strong { color: var(--accent); }
+    .status.paused strong, .status.scheduled_pause strong { color: var(--warn); }
+    .status.stopped strong { color: var(--muted); }
+    label { display: block; font-size: 12px; color: var(--muted); font-weight: 700; margin-bottom: 6px; }
+    input, textarea, select {
+      width: 100%; background: var(--card); color: var(--text); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px; font: inherit;
+    }
+    textarea { resize: vertical; min-height: 140px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+    button {
+      border: 0; border-radius: 10px; padding: 10px 14px; font-weight: 700; cursor: pointer;
+      background: var(--accent); color: #04140a;
+    }
+    button.secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    button.warn { background: var(--warn); color: #2a1d00; }
+    button.danger { background: var(--danger); color: #2a060b; }
+    button:disabled {
+      opacity: 1;
+      cursor: not-allowed;
+      background: #1a2336;
+      color: #6d7b94;
+      border: 1px solid #2a364d;
+      box-shadow: none;
+    }
+    .error { color: var(--danger); font-size: 12px; min-height: 16px; }
+    .hint { color: var(--muted); font-size: 12px; }
+    .card { padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
+    .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .check input { width: auto; }
+    .window { border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-top: 10px; }
+    .window-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .stepper { display: flex; align-items: center; gap: 6px; }
+    .stepper button { min-width: 36px; padding: 8px 0; }
+    .stepper .hour { min-width: 64px; text-align: center; font-weight: 700; }
+    .days { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .days button { min-width: 38px; padding: 7px 8px; }
+    .days button.on { background: var(--accent); color: #04140a; }
+    .repeat { display: flex; gap: 6px; }
+    .repeat button.on { background: var(--accent); color: #04140a; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>RunGPU Agent</h1>
+      <p class="sub">Keep this window open. Pause disconnects earning; Stop ends the process.</p>
+    </div>
+    <div class="sub" id="version"></div>
+  </header>
+  <div class="status stopped" id="summary">
+    <strong>Checking this machine…</strong>
+    <div class="hint" id="summary-next"></div>
+  </div>
+  <div id="token-wrap">
+    <label for="token">Enrollment token</label>
+    <input id="token" spellcheck="false" autocomplete="off" placeholder="Paste the token or the full init command">
+  </div>
+  <div class="row">
+    <button id="enroll" type="button">Enroll</button>
+    <button id="unenroll" class="danger" type="button">Unenroll</button>
+    <button id="setup" class="secondary" type="button">Setup</button>
+    <button id="start" class="secondary" type="button">Start</button>
+    <button id="pause" class="warn" type="button">Pause</button>
+    <button id="resume" type="button">Resume</button>
+    <button id="stop" class="danger" type="button">Stop</button>
+    <button id="refresh" class="secondary" type="button">Status</button>
+  </div>
+  <div class="card">
+    <p style="font-weight:700;margin:0 0 8px">Schedule</p>
+    <p class="hint" style="margin:0 0 10px">Add daily or weekly windows. + / − change hours. The process stays up outside these hours.</p>
+    <label class="check"><input id="sched-enabled" type="checkbox"> Earn only during these hours</label>
+    <div id="sched-windows"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="add-window" class="secondary" type="button">+ Add window</button>
+    </div>
+    <div style="margin-top:10px">
+      <label for="sched-tz">Timezone</label>
+      <input id="sched-tz" placeholder="Leave blank for this computer">
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="save-schedule" class="secondary" type="button">Save schedule</button>
+    </div>
+  </div>
+  <div class="error" id="error"></div>
+  <div>
+    <label for="log">Activity</label>
+    <textarea id="log" readonly></textarea>
+    <p class="hint">Command: schedule --start 18 --end 23, or --days mon,tue,wed --add, or --off.</p>
+  </div>
+  <script>
+    const weekdays = [
+      { id: "mon", label: "Mon" },
+      { id: "tue", label: "Tue" },
+      { id: "wed", label: "Wed" },
+      { id: "thu", label: "Thu" },
+      { id: "fri", label: "Fri" },
+      { id: "sat", label: "Sat" },
+      { id: "sun", label: "Sun" },
+    ];
+    let scheduleWindows = [{ start_hour: 18, end_hour: 23, days: [] }];
+    let scheduleDirty = false;
+    const token = document.getElementById("token");
+    const log = document.getElementById("log");
+    const error = document.getElementById("error");
+    const summary = document.getElementById("summary");
+    const summaryNext = document.getElementById("summary-next");
+    const version = document.getElementById("version");
+    const buttons = {
+      enroll: document.getElementById("enroll"),
+      unenroll: document.getElementById("unenroll"),
+      setup: document.getElementById("setup"),
+      start: document.getElementById("start"),
+      pause: document.getElementById("pause"),
+      resume: document.getElementById("resume"),
+      stop: document.getElementById("stop"),
+      refresh: document.getElementById("refresh"),
+      save: document.getElementById("save-schedule"),
+    };
+
+    async function api(path, options) {
+      const res = await fetch(path, options);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    function render(state) {
+      const rawVersion = String(state.version || "").replace(/^v/i, "");
+      version.textContent = !rawVersion || /^dev/i.test(rawVersion) ? "" : "v" + rawVersion;
+      const mode = state.running ? (state.earning_mode || "earning") : "stopped";
+      summary.className = "status " + mode;
+      summary.querySelector("strong").textContent = state.running
+        ? (state.earning || "Agent running")
+        : (state.enrolled ? "Ready — click Start to earn" : "Not enrolled");
+      summaryNext.textContent = [
+        state.enrolled ? ("Enrolled" + (state.machine_id ? " · " + state.machine_id : "")) : "Not enrolled",
+        state.running ? "Connected to the pool" : "Not connected yet",
+        state.earning_next || "",
+      ].filter(Boolean).join(" · ");
+      if (state.logs) log.value = state.logs;
+      log.scrollTop = log.scrollHeight;
+      document.getElementById("sched-enabled").checked = Boolean(state.schedule_enabled);
+      if (!scheduleDirty) {
+        document.getElementById("sched-tz").value = state.schedule_timezone || "";
+        if (Array.isArray(state.schedule_windows) && state.schedule_windows.length) {
+          scheduleWindows = state.schedule_windows.map((win) => ({
+            start_hour: Number(win.start_hour ?? 18),
+            end_hour: Number(win.end_hour ?? 23),
+            days: Array.isArray(win.days) ? win.days.slice() : [],
+          }));
+        }
+        renderWindows();
+      }
+      const busy = Boolean(state.busy);
+      const tokenWrap = document.getElementById("token-wrap");
+      tokenWrap.style.display = state.enrolled ? "none" : "";
+      buttons.enroll.textContent = state.enrolled ? "Enrolled" : "Enroll";
+      buttons.enroll.disabled = busy || state.running || state.enrolled;
+      buttons.unenroll.disabled = busy || !state.enrolled;
+      buttons.setup.disabled = busy || state.running;
+      buttons.start.disabled = busy || state.running;
+      buttons.pause.disabled = busy || !state.running || state.paused;
+      buttons.resume.disabled = busy || !state.running || !state.paused;
+      buttons.stop.disabled = busy || !state.running;
+      buttons.refresh.disabled = busy;
+      buttons.save.disabled = busy;
+      document.getElementById("add-window").disabled = busy;
+    }
+
+    async function refresh() {
+      const state = await api("/api/state");
+      render(state);
+      return state;
+    }
+
+    async function action(path, body) {
+      error.textContent = "";
+      try {
+        const state = await api(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+        render(state);
+      } catch (err) {
+        error.textContent = err.message;
+        refresh().catch(() => {});
+      }
+    }
+
+    buttons.enroll.onclick = () => action("/api/enroll", { token: token.value });
+    buttons.unenroll.onclick = () => {
+      if (!window.confirm("Remove enrollment from this computer? This deletes the local config only.")) {
+        return;
+      }
+      action("/api/unenroll");
+    };
+    buttons.setup.onclick = () => action("/api/setup");
+    buttons.start.onclick = () => action("/api/start");
+    buttons.pause.onclick = () => action("/api/pause");
+    buttons.resume.onclick = () => action("/api/resume");
+    buttons.stop.onclick = () => action("/api/stop");
+    buttons.refresh.onclick = () => action("/api/status");
+    function hourLabel(hour) {
+      return String(((hour % 24) + 24) % 24).padStart(2, "0") + ":00";
+    }
+
+    function bumpHour(value, delta) {
+      return (((Number(value) + delta) % 24) + 24) % 24;
+    }
+
+    function renderWindows() {
+      const root = document.getElementById("sched-windows");
+      root.innerHTML = "";
+      scheduleWindows.forEach((win, index) => {
+        const weekly = Array.isArray(win.days) && win.days.length > 0;
+        const box = document.createElement("div");
+        box.className = "window";
+        box.innerHTML = `
+          <div class="window-head">
+            <div class="repeat">
+              <button type="button" class="secondary${weekly ? "" : " on"}" data-repeat="daily">Daily</button>
+              <button type="button" class="secondary${weekly ? " on" : ""}" data-repeat="weekly">Weekly</button>
+            </div>
+            <button type="button" class="secondary" data-remove ${scheduleWindows.length < 2 ? "disabled" : ""}>−</button>
+          </div>
+          <div class="grid">
+            <div>
+              <label>Start</label>
+              <div class="stepper">
+                <button type="button" class="secondary" data-start="-1">−</button>
+                <div class="hour">${hourLabel(win.start_hour)}</div>
+                <button type="button" class="secondary" data-start="1">+</button>
+              </div>
+            </div>
+            <div>
+              <label>End (pause)</label>
+              <div class="stepper">
+                <button type="button" class="secondary" data-end="-1">−</button>
+                <div class="hour">${hourLabel(win.end_hour)}</div>
+                <button type="button" class="secondary" data-end="1">+</button>
+              </div>
+            </div>
+          </div>
+          <div class="days" ${weekly ? "" : "style=\"display:none\""}></div>
+        `;
+        const daysEl = box.querySelector(".days");
+        weekdays.forEach((day) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "secondary" + (win.days.includes(day.id) ? " on" : "");
+          btn.textContent = day.label;
+          btn.onclick = () => {
+            if (win.days.includes(day.id)) {
+              win.days = win.days.filter((item) => item !== day.id);
+            } else {
+              win.days = weekdays.map((item) => item.id).filter((id) => win.days.includes(id) || id === day.id);
+            }
+            scheduleDirty = true;
+            renderWindows();
+          };
+          daysEl.append(btn);
+        });
+        box.querySelectorAll("[data-repeat]").forEach((btn) => {
+          btn.onclick = () => {
+            win.days = btn.getAttribute("data-repeat") === "weekly" ? ["mon", "tue", "wed", "thu", "fri"] : [];
+            scheduleDirty = true;
+            renderWindows();
+          };
+        });
+        box.querySelectorAll("[data-start]").forEach((btn) => {
+          btn.onclick = () => {
+            win.start_hour = bumpHour(win.start_hour, Number(btn.getAttribute("data-start")));
+            scheduleDirty = true;
+            renderWindows();
+          };
+        });
+        box.querySelectorAll("[data-end]").forEach((btn) => {
+          btn.onclick = () => {
+            win.end_hour = bumpHour(win.end_hour, Number(btn.getAttribute("data-end")));
+            scheduleDirty = true;
+            renderWindows();
+          };
+        });
+        const remove = box.querySelector("[data-remove]");
+        if (remove) {
+          remove.onclick = () => {
+            if (scheduleWindows.length < 2) return;
+            scheduleWindows.splice(index, 1);
+            scheduleDirty = true;
+            renderWindows();
+          };
+        }
+        root.append(box);
+      });
+    }
+
+    document.getElementById("add-window").onclick = () => {
+      scheduleWindows.push({ start_hour: 9, end_hour: 17, days: ["mon", "tue", "wed", "thu", "fri"] });
+      scheduleDirty = true;
+      renderWindows();
+    };
+    buttons.save.onclick = () => {
+      scheduleDirty = false;
+      action("/api/schedule", {
+        enabled: document.getElementById("sched-enabled").checked,
+        timezone: document.getElementById("sched-tz").value,
+        windows: scheduleWindows,
+      });
+    };
+
+    setInterval(() => {
+      fetch("/api/ping", { method: "POST" }).catch(() => {});
+      refresh().catch(() => {});
+    }, 2000);
+    refresh().catch((err) => { error.textContent = err.message; });
+  </script>
+</body>
+</html>

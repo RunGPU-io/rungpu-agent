@@ -1,0 +1,119 @@
+package dockermgr
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func argValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildRunArgsGPUScoping(t *testing.T) {
+	m := New()
+
+	if got := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "c", UseGPU: false}); hasFlag(got, "--gpus") {
+		t.Errorf("UseGPU=false should not add --gpus, got %v", got)
+	}
+
+	for _, dev := range []string{"", "all", "ALL", "  "} {
+		args := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "c", Network: "none", UseGPU: true, GPUDevice: dev})
+		if v := argValue(args, "--gpus"); v != "all" {
+			t.Errorf("GPUDevice=%q → --gpus %q, want all", dev, v)
+		}
+	}
+
+	args := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "c", Network: "none", UseGPU: true, GPUDevice: "1"})
+	if v := argValue(args, "--gpus"); v != "device=1" {
+		t.Errorf("GPUDevice=1 → --gpus %q, want device=1", v)
+	}
+}
+
+func TestBuildRunArgsComposition(t *testing.T) {
+	m := New()
+	args := m.buildRunArgs(RunOptions{
+		Image:      "ghcr.io/tokenize/x:latest",
+		Name:       "job-c",
+		Network:    "none",
+		Ports:      []string{"127.0.0.1:8188:8188"},
+		Mounts:     []string{"/home/u/.tokenize/cache:/cache"},
+		Volumes:    []string{"tokenize-vol:/data"},
+		Env:        map[string]string{"FOO": "bar"},
+		ShmSize:    "8g",
+		Entrypoint: "python",
+		Command:    []string{"serve"},
+	})
+
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"run -d --name job-c",
+		"--network none",
+		"--security-opt no-new-privileges",
+		"--shm-size 8g",
+		"-p 127.0.0.1:8188:8188",
+		"-v /home/u/.tokenize/cache:/cache",
+		"-v tokenize-vol:/data",
+		"-e FOO=bar",
+		"--entrypoint python",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q\n got: %s", want, joined)
+		}
+	}
+
+	if args[len(args)-1] != "serve" {
+		t.Errorf("command should be last arg, got %q", args[len(args)-1])
+	}
+	imgIdx, cmdIdx := -1, -1
+	for i, a := range args {
+		if a == "ghcr.io/tokenize/x:latest" {
+			imgIdx = i
+		}
+		if a == "serve" {
+			cmdIdx = i
+		}
+	}
+	if imgIdx < 0 || cmdIdx < 0 || imgIdx > cmdIdx {
+		t.Errorf("image (%d) must come before command (%d)", imgIdx, cmdIdx)
+	}
+}
+
+func TestBuildRunArgsManagedRuntimeCanUseHostMemory(t *testing.T) {
+	m := New()
+	limited := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "limited", Network: "none"})
+	if got := argValue(limited, "--memory"); got != "16g" {
+		t.Fatalf("default memory limit = %q, want 16g", got)
+	}
+
+	hostMemory := m.buildRunArgs(RunOptions{
+		Image: "ubuntu", Name: "managed", Network: "none", UseHostMemory: true,
+	})
+	if got := argValue(hostMemory, "--memory"); got != "" {
+		t.Fatalf("managed runtime memory limit = %q, want Docker host limit", got)
+	}
+	if !hasFlag(hostMemory, "--security-opt") || !hasFlag(hostMemory, "--pids-limit") {
+		t.Fatalf("managed runtime lost sandbox controls: %v", hostMemory)
+	}
+}
+
+func TestRunRejectsUnspecifiedNetwork(t *testing.T) {
+	_, err := New().Run(context.Background(), RunOptions{Image: "ubuntu", Name: "job-c"})
+	if err == nil || !strings.Contains(err.Error(), "network must be none or bridge") {
+		t.Fatalf("expected unspecified network to fail closed, got %v", err)
+	}
+}

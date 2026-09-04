@@ -1,0 +1,468 @@
+package job
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
+)
+
+func TestOllamaModel(t *testing.T) {
+	cases := []struct {
+		name string
+		job  types.JobAssignment
+		want string
+	}{
+		{"simple", types.JobAssignment{ModelName: "llama2"}, "llama2"},
+		{"coordinator tag", types.JobAssignment{ModelName: "registry/model:tag"}, "registry/model:tag"},
+		{"explicit param", types.JobAssignment{ModelName: "x", Parameters: map[string]interface{}{"ollama_model": "mistral:7b"}}, "mistral:7b"},
+		{"preserves case", types.JobAssignment{ModelName: "AssignedTag"}, "AssignedTag"},
+		{"empty param fallback", types.JobAssignment{ModelName: "phi3", Parameters: map[string]interface{}{"ollama_model": ""}}, "phi3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ollamaModel(tc.job); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractPrompt(t *testing.T) {
+	cases := []struct {
+		name string
+		job  types.JobAssignment
+		want string
+	}{
+		{"prompt field", types.JobAssignment{Input: map[string]interface{}{"prompt": "Hello"}}, "Hello"},
+		{"text field", types.JobAssignment{Input: map[string]interface{}{"text": "Sum"}}, "Sum"},
+		{"prompt over text", types.JobAssignment{Input: map[string]interface{}{"prompt": "A", "text": "B"}}, "A"},
+		{"nil input", types.JobAssignment{}, "null"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractPrompt(tc.job); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewRuntime(t *testing.T) {
+	dir := t.TempDir()
+	for _, backend := range []string{"cuda", "metal", "cpu", ""} {
+		rt, err := NewRuntime(backend, dir, 10)
+		if err != nil {
+			t.Fatalf("NewRuntime(%q): %v", backend, err)
+		}
+		if rt.Name() == "" {
+			t.Errorf("NewRuntime(%q).Name() should not be empty", backend)
+		}
+		t.Logf("NewRuntime(%q) -> %q", backend, rt.Name())
+	}
+}
+
+func TestExplicitRuntimeSelection(t *testing.T) {
+	ollama := &ollamaRuntime{}
+	docker := &customDockerRuntime{}
+	workspace := &workspaceRuntime{}
+	runtimes := &multiRuntime{ollama: ollama, dockerCustom: docker, workspace: workspace}
+
+	for runtimeName, expected := range map[string]Runtime{
+		"ollama": ollama, "docker-custom": docker, "workspace": workspace, "comfyui-batch": docker,
+	} {
+		selected, err := runtimes.selectRuntime(types.JobAssignment{Runtime: runtimeName, ModelName: "misleading-video-name"})
+		if err != nil || selected != expected {
+			t.Fatalf("runtime %q selected %T, %v", runtimeName, selected, err)
+		}
+	}
+	if _, err := runtimes.selectRuntime(types.JobAssignment{Runtime: "unknown"}); err == nil {
+		t.Fatal("unknown explicit runtime should be rejected")
+	}
+	if _, err := runtimes.selectRuntime(types.JobAssignment{}); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("missing runtime error = %v", err)
+	}
+}
+
+func TestDockerImageResolution(t *testing.T) {
+	cases := []struct {
+		name    string
+		job     types.JobAssignment
+		want    string
+		wantErr bool
+	}{
+		{"explicit DockerImage field", types.JobAssignment{DockerImage: "myimg:v1"}, "myimg:v1", false},
+		{"explicit param", types.JobAssignment{ModelName: "x", Parameters: map[string]interface{}{"docker_image": "myimg:v1"}}, "myimg:v1", false},
+		{"named workload requires worker", types.JobAssignment{ModelName: "managed-media"}, "", true},
+		{"HF repo style requires worker", types.JobAssignment{ModelName: "org/model"}, "", true},
+		{"unknown no slash", types.JobAssignment{ModelName: "unknown"}, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveImage(tc.job)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveWorkspace(t *testing.T) {
+	img2, ports2, _, _, _ := resolveWorkspace(types.JobAssignment{
+		ModelName:  "custom",
+		Parameters: map[string]interface{}{"docker_image": "myimg:v1", "ports": "9090"},
+	})
+	if img2 != "myimg:v1" {
+		t.Errorf("image = %q, want myimg:v1", img2)
+	}
+	if len(ports2) != 1 || ports2[0] != "9090:9090" {
+		t.Errorf("ports = %v, want [9090:9090]", ports2)
+	}
+	img3, ports3, _, _, _ := resolveWorkspace(types.JobAssignment{
+		ModelName: "custom", DockerImage: "top-level:v2", Ports: []string{"8188"},
+	})
+	if img3 != "top-level:v2" || len(ports3) != 1 || ports3[0] != "8188:8188" {
+		t.Errorf("top-level workspace fields ignored: image=%q ports=%v", img3, ports3)
+	}
+}
+
+func TestModelID(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"llama2", "llama2"},
+		{"meta-llama/Llama-2-7b", "meta-llama_Llama-2-7b"},
+		{"org/sub/model", "org_sub_model"},
+	} {
+		if got := modelID(tc.in); got != tc.want {
+			t.Errorf("modelID(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestOllamaRuntimeWithMockServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&req)
+		model, _ := req["model"].(string)
+		prompt, _ := req["prompt"].(string)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"model": model, "response": "I am " + model + ". You said: " + prompt,
+			"done": true, "eval_count": 42,
+		})
+	}))
+	defer srv.Close()
+
+	rt := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 10 * time.Second},
+	}
+
+	result, err := rt.Run(context.Background(), types.JobAssignment{
+		JobID: "m1", ModelName: "llama2",
+		Input: map[string]interface{}{"prompt": "What is 2+2?"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result["status"] != "completed" {
+		t.Errorf("status = %v", result["status"])
+	}
+	if result["model"] != "llama2" {
+		t.Errorf("model = %v", result["model"])
+	}
+	resp := result["response"].(string)
+	if !strings.Contains(resp, "llama2") {
+		t.Errorf("response should mention model: %q", resp)
+	}
+
+	switch v := result["eval_count"].(type) {
+	case float64:
+		if v != 42 {
+			t.Errorf("eval_count = %v", v)
+		}
+	case int:
+		if v != 42 {
+			t.Errorf("eval_count = %v", v)
+		}
+	default:
+		t.Errorf("eval_count unexpected type %T = %v", result["eval_count"], result["eval_count"])
+	}
+	t.Logf("Response: %s", resp)
+}
+
+func TestOllamaRuntimeServerError(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Ollama is running"))
+			return
+		}
+		http.Error(w, "boom", 500)
+	}))
+	defer srv.Close()
+
+	rt := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 5 * time.Second},
+	}
+	_, err := rt.Run(context.Background(), types.JobAssignment{
+		JobID: "e1", ModelName: "llama2", Input: map[string]interface{}{"prompt": "x"},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("error should mention 500: %v", err)
+	}
+}
+
+func TestOllamaRuntimeServerDown(t *testing.T) {
+	rt := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: "http://127.0.0.1:1",
+		backend: "cpu", client: &http.Client{Timeout: 2 * time.Second},
+	}
+	_, err := rt.Run(context.Background(), types.JobAssignment{
+		JobID: "d1", ModelName: "llama2", Input: map[string]interface{}{"prompt": "x"},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !strings.Contains(err.Error(), "not responding") {
+		t.Errorf("error should mention 'not responding': %v", err)
+	}
+}
+
+type skipPrepare struct{ inner Runtime }
+
+func (s *skipPrepare) Name() string                                           { return s.inner.Name() }
+func (s *skipPrepare) Prepare(_ context.Context, _ types.JobAssignment) error { return nil }
+func (s *skipPrepare) Run(ctx context.Context, a types.JobAssignment) (map[string]interface{}, error) {
+	return s.inner.Run(ctx, a)
+}
+func (s *skipPrepare) Cleanup(force bool) error { return s.inner.Cleanup(force) }
+
+func TestExecutorEndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&req)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"model": req["model"], "response": "The answer is 4.",
+			"done": true, "eval_count": 10,
+		})
+	}))
+	defer srv.Close()
+
+	mockRT := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 10 * time.Second},
+	}
+	exec := &Executor{runtime: &skipPrepare{inner: mockRT}, gpuID: "gpu-e2e", backend: "cpu"}
+
+	result := exec.Execute(context.Background(), types.JobAssignment{
+		JobID: "e2e-1", ModelName: "llama2",
+		Input: map[string]interface{}{"prompt": "What is 2+2?"},
+	})
+
+	if !result.Success {
+		t.Fatalf("failed: %s", result.Error)
+	}
+	if result.JobID != "e2e-1" {
+		t.Errorf("JobID = %q", result.JobID)
+	}
+	if result.GPUID != "gpu-e2e" {
+		t.Errorf("GPUID = %q", result.GPUID)
+	}
+	if result.Result["response"] != "The answer is 4." {
+		t.Errorf("response = %v", result.Result["response"])
+	}
+	t.Logf("E2E: success=%v duration=%dms response=%v", result.Success, result.DurationMS, result.Result["response"])
+}
+
+func TestExecutorReportsHostBackend(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"model": "llama3", "response": "ok", "done": true, "eval_count": 1,
+		})
+	}))
+	defer srv.Close()
+
+	mockRT := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 10 * time.Second},
+	}
+	exec := &Executor{runtime: &skipPrepare{inner: mockRT}, gpuID: "gpu-e2e", backend: "cuda"}
+
+	result := exec.Execute(context.Background(), types.JobAssignment{
+		JobID: "backend-1", ModelName: "llama3",
+		Input: map[string]interface{}{"prompt": "hi"},
+	})
+	if !result.Success {
+		t.Fatalf("failed: %s", result.Error)
+	}
+	if result.Result["backend"] != "cuda" {
+		t.Errorf("backend = %v, want cuda from the host executor not ollama's cpu default", result.Result["backend"])
+	}
+}
+
+func TestExecutorHandlesFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", 500)
+	}))
+	defer srv.Close()
+
+	mockRT := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 5 * time.Second},
+	}
+	exec := &Executor{runtime: &skipPrepare{inner: mockRT}, gpuID: "gpu-fail", backend: "cpu"}
+
+	result := exec.Execute(context.Background(), types.JobAssignment{
+		JobID: "fail-1", ModelName: "llama2",
+		Input: map[string]interface{}{"prompt": "x"},
+	})
+
+	if result.Success {
+		t.Fatal("expected failure")
+	}
+	if result.Error == "" {
+		t.Error("Error should not be empty")
+	}
+	if result.JobID != "fail-1" {
+		t.Errorf("JobID = %q", result.JobID)
+	}
+}
+
+func TestOllamaCacheHit(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"modelfile": "FROM llama2"})
+			return
+		}
+		if r.URL.Path == "/api/generate" {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"model": "llama2", "response": "cached!", "done": true, "eval_count": 1,
+			})
+			return
+		}
+	}))
+	defer srv.Close()
+
+	rt := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 5 * time.Second},
+	}
+
+	if !rt.isModelCached(context.Background(), "llama2") {
+		t.Fatal("should report cached when /api/show returns 200")
+	}
+
+	res, err := rt.Run(context.Background(), types.JobAssignment{
+		JobID: "ch-1", ModelName: "llama2",
+		Input: map[string]interface{}{"prompt": "test"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res["response"] != "cached!" {
+		t.Errorf("response = %v", res["response"])
+	}
+}
+
+func TestOllamaCacheMiss(t *testing.T) {
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			http.Error(w, "not found", 404)
+			return
+		}
+	}))
+	defer srv.Close()
+
+	rt := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 5 * time.Second},
+	}
+
+	if rt.isModelCached(context.Background(), "nonexistent") {
+		t.Error("should report NOT cached when /api/show returns 404")
+	}
+}
+
+func TestFullPipelineCacheAndRun(t *testing.T) {
+	generates := 0
+	showCached := false
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/show":
+			if showCached {
+				json.NewEncoder(w).Encode(map[string]interface{}{"modelfile": "ok"})
+			} else {
+				http.Error(w, "not found", 404)
+			}
+		case "/api/generate":
+			generates++
+			var req map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&req)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"model": req["model"], "response": "Answer: 42",
+				"done": true, "eval_count": 5,
+			})
+		}
+	}))
+	defer srv.Close()
+
+	rt := &ollamaRuntime{
+		cacheDir: t.TempDir(), endpoint: srv.URL,
+		backend: "cpu", client: &http.Client{Timeout: 10 * time.Second},
+	}
+	job := types.JobAssignment{
+		JobID: "fp-1", ModelName: "llama2",
+		Input: map[string]interface{}{"prompt": "meaning of life?"},
+	}
+
+	if rt.isModelCached(context.Background(), "llama2") {
+		t.Fatal("should not be cached yet")
+	}
+
+	showCached = true
+
+	if !rt.isModelCached(context.Background(), "llama2") {
+		t.Fatal("should be cached after pull")
+	}
+
+	res, err := rt.Run(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res["response"] != "Answer: 42" {
+		t.Errorf("response = %v", res["response"])
+	}
+
+	res2, _ := rt.Run(context.Background(), job)
+	if res2["response"] != "Answer: 42" {
+		t.Errorf("response 2 = %v", res2["response"])
+	}
+	if generates != 2 {
+		t.Errorf("expected 2 generates, got %d", generates)
+	}
+
+	t.Logf("Pipeline: generates=%d, response=%v", generates, res["response"])
+}

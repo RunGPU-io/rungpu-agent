@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          BINARY="rungpu-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "${BINARY}" .
+          echo "BINARY=${BINARY}" >> $GITHUB_ENV
+
+      - name: Create archive
+        run: |
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            zip "${{ env.BINARY }}.zip" "${{ env.BINARY }}"
+            echo "ARCHIVE=${{ env.BINARY }}.zip" >> $GITHUB_ENV
+          elif [[ "${{ matrix.goos }}" == "darwin" ]]; then
+            bash scripts/macos-app.sh "${{ env.BINARY }}" "${GITHUB_REF_NAME}" "RunGPU Agent.app"
+            tar czf "${{ env.BINARY }}.tar.gz" "${{ env.BINARY }}" "RunGPU Agent.app"
+            echo "ARCHIVE=${{ env.BINARY }}.tar.gz" >> $GITHUB_ENV
+          else
+            tar czf "${{ env.BINARY }}.tar.gz" "${{ env.BINARY }}"
+            echo "ARCHIVE=${{ env.BINARY }}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.BINARY }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      - name: Collect archives
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release/ \;
+          ls -lh release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'release/*'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: RunGPU Agent ${{ github.ref_name }}
+          body: |
+            ## RunGPU GPU Agent ${{ github.ref_name }}
+
+            Cross-platform GPU agent for the [RunGPU](https://www.rungpu.io) P2P GPU marketplace.
+
+            ### Downloads
+
+            | Platform | Architecture | Download |
+            |----------|-------------|----------|
+            | Linux | x86_64 (AMD/Intel) | `rungpu-agent-linux-amd64.tar.gz` |
+            | Linux | ARM64 (Raspberry Pi, AWS Graviton) | `rungpu-agent-linux-arm64.tar.gz` |
+            | macOS | Intel | `rungpu-agent-darwin-amd64.tar.gz` |
+            | macOS | Apple Silicon (M1/M2/M3/M4) | `rungpu-agent-darwin-arm64.tar.gz` |
+            | Windows | x86_64 | `rungpu-agent-windows-amd64.exe.zip` |
+
+            ### Quick Start
+
+            Two options after extract: **Command** or **GUI**.
+
+            **GUI:** paste your enrollment token, then click Enroll, Setup, and Start. On Windows, double-click the `.exe`. On macOS, open `RunGPU Agent.app`. On Linux, run `./rungpu-agent-linux-amd64 gui`.
+
+            **Command:**
+
+            ```bash
+            # Download and extract (example: macOS Apple Silicon)
+            tar xzf rungpu-agent-darwin-arm64.tar.gz
+            chmod +x rungpu-agent-darwin-arm64
+
+            # Enroll with this machine's one-time token
+            ./rungpu-agent-darwin-arm64 init --enrollment-token YOUR_ONE_TIME_TOKEN
+
+            # Install supported runtime requirements
+            ./rungpu-agent-darwin-arm64 setup
+
+            # Confirm the binary matches this GitHub release tag
+            ./rungpu-agent-darwin-arm64 version
+
+            # Start earning
+            ./rungpu-agent-darwin-arm64 start
+            ```
+
+            Create an enrollment token at [rungpu.io/marketplace/host](https://www.rungpu.io/marketplace/host)
+
+            ### Verify Download
+
+            ```bash
+            sha256sum -c checksums.txt
+            gh attestation verify rungpu-agent-linux-amd64.tar.gz --repo RunGPU-io/rungpu-agent
+            ```
+
+            See [README](https://github.com/RunGPU-io/rungpu-agent#readme) for full documentation.
+          files: release/*
+          draft: false
+          prerelease: false
