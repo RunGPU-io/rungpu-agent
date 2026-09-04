@@ -16,7 +16,7 @@ jobs:
         with:
           go-version: '1.22'
       - name: Audit public source boundary
-        run: ./scripts/audit-public.sh
+        run: bash scripts/audit-public.sh
       - name: Build
         run: go build -v ./...
       - name: Vet
@@ -41,9 +41,9 @@ jobs:
       - name: Verify Docker
         run: docker version
       - name: Clean Linux install and service-user inference
-        run: ./scripts/test-clean-ollama-linux.sh
+        run: bash scripts/test-clean-ollama-linux.sh
       - name: Install Ollama on runner
-        run: sudo ./scripts/install-ollama-linux.sh
+        run: sudo bash scripts/install-ollama-linux.sh
       - name: Native and Docker inference
         env:
           RUNGPU_RUNTIME_SMOKE: '1'
