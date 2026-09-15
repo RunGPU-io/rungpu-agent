@@ -51,6 +51,36 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadOrCreateInstallationIDIsStable(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	first, err := LoadOrCreateInstallationID(configPath)
+	if err != nil {
+		t.Fatalf("first installation ID: %v", err)
+	}
+	second, err := LoadOrCreateInstallationID(configPath)
+	if err != nil {
+		t.Fatalf("second installation ID: %v", err)
+	}
+	if first == "" || second != first {
+		t.Fatalf("installation ID was not stable: %q then %q", first, second)
+	}
+}
+
+func TestLoadOrCreateInstallationSecretIsStable(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	first, err := LoadOrCreateInstallationSecret(configPath)
+	if err != nil {
+		t.Fatalf("first installation secret: %v", err)
+	}
+	second, err := LoadOrCreateInstallationSecret(configPath)
+	if err != nil {
+		t.Fatalf("second installation secret: %v", err)
+	}
+	if len(first) != 43 || second != first {
+		t.Fatalf("installation secret was not stable")
+	}
+}
+
 func TestValidate(t *testing.T) {
 	good := &types.Config{APIKey: "k", PoolURL: "u", GPUIDs: []string{"g"}, MaxModelCacheGB: 1}
 	if err := Validate(good); err != nil {
@@ -108,7 +138,8 @@ func TestSaveCreatesFileWith0600(t *testing.T) {
 	}
 
 	perm := info.Mode().Perm()
-
+	// On Unix, should be 0600 (owner read/write only).
+	// On Windows, file permissions work differently — skip the check.
 	if configPermissionsNeedWarning(runtime.GOOS, perm) {
 		t.Errorf("config file permissions = %o, want 0600 (no group/other access)", perm)
 	}

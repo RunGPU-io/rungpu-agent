@@ -1,6 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -8,6 +14,54 @@ import (
 func TestVersionHasBuildFallback(t *testing.T) {
 	if strings.TrimSpace(version) == "" {
 		t.Fatal("version must have a non-empty fallback for local builds")
+	}
+}
+
+func TestBatchEnrollmentSendsMachineIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fleet/batch/enroll" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if body["batch_token"] != "batch-secret" || body["installation_id"] != "install-123" || body["installation_secret"] != "install-secret" || body["hostname"] != "rack-a1" {
+			t.Fatalf("unexpected identity payload: %#v", body)
+		}
+		if body["operating_system"] != runtime.GOOS || body["architecture"] != runtime.GOARCH {
+			t.Fatalf("unexpected platform payload: %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"machine_id":"machine-1","agent_key":"agent-key","price_per_minute":0}`))
+	}))
+	defer server.Close()
+
+	result, err := enrollMachineBatch(server.URL, "batch-secret", "install-123", "install-secret", "rack-a1")
+	if err != nil {
+		t.Fatalf("enrollMachineBatch: %v", err)
+	}
+	if result.MachineID != "machine-1" || result.AgentKey != "agent-key" {
+		t.Fatalf("unexpected response: %#v", result)
+	}
+}
+
+func TestReadBatchTokenFileRequiresPrivatePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch-token")
+	if err := os.WriteFile(path, []byte("batch-secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := readBatchTokenFile(path)
+	if err != nil || strings.TrimSpace(string(contents)) != "batch-secret" {
+		t.Fatalf("read private token: contents=%q err=%v", contents, err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readBatchTokenFile(path); err == nil {
+			t.Fatal("expected readable-by-others token file to be rejected")
+		}
 	}
 }
 

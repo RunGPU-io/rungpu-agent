@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RunGPU-io/rungpu-agent/internal/types"
 	"github.com/gorilla/websocket"
+	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
 func TestHeartbeatSent(t *testing.T) {
@@ -84,7 +84,7 @@ func TestJobDispatchAndResult(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.ReadMessage()
+		conn.ReadMessage() // register
 		conn.WriteJSON(map[string]interface{}{
 			"type": "job_assignment", "job_id": "j1",
 			"model_name": "test", "input": map[string]interface{}{"prompt": "hi"},

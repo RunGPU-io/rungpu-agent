@@ -20,7 +20,7 @@ func TestSplitCSV(t *testing.T) {
 }
 
 func TestDetectAlwaysReturnsOne(t *testing.T) {
-
+	// Detect must never return empty, even with no NVIDIA GPU present.
 	gpus := Detect()
 	if len(gpus) == 0 {
 		t.Fatal("Detect() returned no GPUs; expected at least a fallback entry")
@@ -28,7 +28,8 @@ func TestDetectAlwaysReturnsOne(t *testing.T) {
 }
 
 func TestIsHealthyWithNoMetrics(t *testing.T) {
-
+	// A monitor with a CPU-only / zero-memory device must report healthy
+	// (no division-by-zero, no false negatives).
 	m := &Monitor{
 		gpus:      []types.GPUInfo{{Index: 0, Name: "cpu-only", MemoryMB: 0}},
 		hasNvidia: false,

@@ -70,7 +70,7 @@ func parseCoordinatorDrive(params map[string]interface{}) coordinatorDrive {
 			to, _ := item["to"].(string)
 			from = filepath.ToSlash(strings.TrimSpace(from))
 			to = strings.TrimSpace(to)
-			if from == "" || to == "" || strings.Contains(from, "..") || strings.HasPrefix(from, "/") {
+			if !allowedStageFrom(from) || to == "" {
 				continue
 			}
 			ro := true
@@ -81,6 +81,20 @@ func parseCoordinatorDrive(params map[string]interface{}) coordinatorDrive {
 		}
 	}
 	return drive
+}
+
+func allowedStageFrom(from string) bool {
+	from = filepath.ToSlash(strings.TrimSpace(from))
+	if from == "" || strings.Contains(from, "..") {
+		return false
+	}
+	if strings.HasPrefix(from, "/") || strings.HasPrefix(from, "\\") {
+		return false
+	}
+	if len(from) >= 2 && from[1] == ':' {
+		return false
+	}
+	return !filepath.IsAbs(filepath.FromSlash(from))
 }
 
 func stringSliceParam(value interface{}) []string {

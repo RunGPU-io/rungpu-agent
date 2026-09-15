@@ -1,4 +1,4 @@
-package job
+﻿package job
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
+
+// Unit tests for pure functions
 
 func TestOllamaModel(t *testing.T) {
 	cases := []struct {
@@ -152,6 +154,8 @@ func TestModelID(t *testing.T) {
 	}
 }
 
+// Mock Ollama integration test
+
 func TestOllamaRuntimeWithMockServer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]interface{}
@@ -187,7 +191,7 @@ func TestOllamaRuntimeWithMockServer(t *testing.T) {
 	if !strings.Contains(resp, "llama2") {
 		t.Errorf("response should mention model: %q", resp)
 	}
-
+	// eval_count may be int or float64 depending on Go version's JSON decoder
 	switch v := result["eval_count"].(type) {
 	case float64:
 		if v != 42 {
@@ -204,10 +208,10 @@ func TestOllamaRuntimeWithMockServer(t *testing.T) {
 }
 
 func TestOllamaRuntimeServerError(t *testing.T) {
-
+	// Server that returns 500 for /api/generate but 200 for health check (GET /)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-
+			// Health check — server is "running" but broken
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("Ollama is running"))
 			return
@@ -242,12 +246,15 @@ func TestOllamaRuntimeServerDown(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-
+	// Non-default endpoint: ensureServerRunning returns "not responding" error
 	if !strings.Contains(err.Error(), "not responding") {
 		t.Errorf("error should mention 'not responding': %v", err)
 	}
 }
 
+// Full executor end-to-end with mock
+
+// skipPrepare wraps a runtime and skips Prepare (no real ollama in tests).
 type skipPrepare struct{ inner Runtime }
 
 func (s *skipPrepare) Name() string                                           { return s.inner.Name() }
@@ -348,8 +355,10 @@ func TestExecutorHandlesFailure(t *testing.T) {
 	}
 }
 
-func TestOllamaCacheHit(t *testing.T) {
+// Cache behavior tests
 
+func TestOllamaCacheHit(t *testing.T) {
+	// Mock: /api/show returns 200 (model cached)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" {
 			json.NewEncoder(w).Encode(map[string]interface{}{"modelfile": "FROM llama2"})
@@ -386,7 +395,7 @@ func TestOllamaCacheHit(t *testing.T) {
 }
 
 func TestOllamaCacheMiss(t *testing.T) {
-
+	// Mock: /api/show returns 404 (model not cached)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" {
 			http.Error(w, "not found", 404)
@@ -438,16 +447,20 @@ func TestFullPipelineCacheAndRun(t *testing.T) {
 		Input: map[string]interface{}{"prompt": "meaning of life?"},
 	}
 
+	// 1. Not cached
 	if rt.isModelCached(context.Background(), "llama2") {
 		t.Fatal("should not be cached yet")
 	}
 
+	// 2. Simulate pull completed
 	showCached = true
 
+	// 3. Now cached
 	if !rt.isModelCached(context.Background(), "llama2") {
 		t.Fatal("should be cached after pull")
 	}
 
+	// 4. Run inference
 	res, err := rt.Run(context.Background(), job)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -456,6 +469,7 @@ func TestFullPipelineCacheAndRun(t *testing.T) {
 		t.Errorf("response = %v", res["response"])
 	}
 
+	// 5. Run again — still cached
 	res2, _ := rt.Run(context.Background(), job)
 	if res2["response"] != "Answer: 42" {
 		t.Errorf("response 2 = %v", res2["response"])

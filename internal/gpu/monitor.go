@@ -1,3 +1,7 @@
+// Package gpu provides cross-platform, cgo-free GPU detection and monitoring.
+// NVIDIA GPUs are read by parsing `nvidia-smi` (Linux/Windows); macOS falls
+// back to `sysctl`. If nothing is found, a CPU-only placeholder is returned so
+// the agent still runs everywhere.
 package gpu
 
 import (
@@ -11,6 +15,8 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
+// Detect returns the available accelerators. It never fails and always returns
+// at least one entry.
 func Detect() []types.GPUInfo {
 	if gpus := detectNvidia(); len(gpus) > 0 {
 		return gpus
@@ -20,7 +26,7 @@ func Detect() []types.GPUInfo {
 			return gpus
 		}
 	}
-
+	// CPU-only fallback (e.g. macOS, or a host without NVIDIA GPUs).
 	return []types.GPUInfo{{
 		Index:             0,
 		Name:              "cpu-only",
@@ -30,6 +36,7 @@ func Detect() []types.GPUInfo {
 	}}
 }
 
+// detectNvidia parses `nvidia-smi`. Returns nil if nvidia-smi is unavailable.
 func detectNvidia() []types.GPUInfo {
 	out, err := commandOutput("nvidia-smi",
 		"--query-gpu=index,name,memory.total,driver_version",
@@ -57,12 +64,16 @@ func detectNvidia() []types.GPUInfo {
 	return gpus
 }
 
+// detectMacOS reports the Apple Silicon SoC via sysctl and system_profiler;
+// unified memory is used as the GPU memory figure. On Intel Macs without a
+// discrete GPU, the integrated GPU name is read from system_profiler.
 func detectMacOS() []types.GPUInfo {
 	name := sysctl("machdep.cpu.brand_string")
 	if name == "" {
 		name = "Apple GPU"
 	}
 
+	// Try to get the actual GPU chip name from system_profiler (e.g. "Apple M2 Pro").
 	if gpuName := detectMacGPUName(); gpuName != "" {
 		name = gpuName
 	}
@@ -74,6 +85,8 @@ func detectMacOS() []types.GPUInfo {
 		}
 	}
 
+	// Determine compute capability: Apple Silicon supports Metal, Intel Macs
+	// may only have an integrated GPU without Metal compute support.
 	capability := "metal"
 	driver := macOSVersion()
 	if driver == "" {
@@ -89,12 +102,14 @@ func detectMacOS() []types.GPUInfo {
 	}}
 }
 
+// detectMacGPUName uses system_profiler to find the GPU chip name. Returns ""
+// if unavailable. Works on both Apple Silicon and Intel Macs.
 func detectMacGPUName() string {
 	out, err := exec.Command("system_profiler", "SPDisplaysDataType", "-detailLevel", "mini").Output()
 	if err != nil {
 		return ""
 	}
-
+	// Look for "Chipset Model:" or "Chip:" lines.
 	for _, line := range strings.Split(string(out), "\n") {
 		trimmed := strings.TrimSpace(line)
 		for _, prefix := range []string{"Chipset Model:", "Chip:"} {
@@ -109,6 +124,7 @@ func detectMacGPUName() string {
 	return ""
 }
 
+// macOSVersion returns the macOS version string (e.g. "15.5") or "".
 func macOSVersion() string {
 	out, err := exec.Command("sw_vers", "-productVersion").Output()
 	if err != nil {
@@ -125,6 +141,7 @@ func sysctl(key string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// Monitor exposes live GPU metrics.
 type Monitor struct {
 	gpus      []types.GPUInfo
 	hasNvidia bool
@@ -138,6 +155,8 @@ func NewMonitor() *Monitor {
 
 func (m *Monitor) GPUs() []types.GPUInfo { return m.gpus }
 
+// Backend reports the execution backend this host supports, derived from the
+// primary accelerator: "cuda" (NVIDIA), "metal" (Apple Silicon), or "cpu".
 func (m *Monitor) Backend() string {
 	if len(m.gpus) == 0 {
 		return "cpu"
@@ -152,13 +171,15 @@ func (m *Monitor) Backend() string {
 	}
 }
 
+// CollectMetrics returns live telemetry via nvidia-smi, or static zeros when
+// NVIDIA isn't present.
 func (m *Monitor) CollectMetrics() []types.GPUMetrics {
 	if m.hasNvidia {
 		if metrics := collectNvidiaMetrics(); len(metrics) > 0 {
 			return metrics
 		}
 	}
-
+	// Fallback: static info, no live telemetry.
 	metrics := make([]types.GPUMetrics, 0, len(m.gpus))
 	for _, g := range m.gpus {
 		metrics = append(metrics, types.GPUMetrics{
@@ -205,6 +226,7 @@ func collectNvidiaMetrics() []types.GPUMetrics {
 	return metrics
 }
 
+// IsHealthy returns false if any GPU is too hot or near memory exhaustion.
 func (m *Monitor) IsHealthy() bool {
 	for _, metric := range m.CollectMetrics() {
 		if metric.TemperatureC != nil && *metric.TemperatureC > 85.0 {
@@ -220,19 +242,24 @@ func (m *Monitor) IsHealthy() bool {
 	return true
 }
 
+// ── System info (CPU, RAM, OS) ──────────────────────────────────────────────
+
+// SystemInfo holds host-level info beyond the GPU.
 type SystemInfo struct {
 	CPUModel   string
 	CPUCores   int
 	RAMTotalGB float64
-	OSInfo     string
+	OSInfo     string // "darwin/arm64", "linux/amd64"
 }
 
+// DetectSystem returns CPU, RAM, and OS info for the host.
 func DetectSystem() SystemInfo {
 	info := SystemInfo{
 		OSInfo:   runtime.GOOS + "/" + runtime.GOARCH,
 		CPUCores: runtime.NumCPU(),
 	}
 
+	// CPU model
 	switch runtime.GOOS {
 	case "darwin":
 		info.CPUModel = sysctl("machdep.cpu.brand_string")
@@ -250,6 +277,7 @@ func DetectSystem() SystemInfo {
 		info.CPUModel = runtime.GOARCH
 	}
 
+	// Total RAM
 	switch runtime.GOOS {
 	case "darwin":
 		if v := sysctl("hw.memsize"); v != "" {
@@ -271,6 +299,7 @@ func DetectSystem() SystemInfo {
 	return info
 }
 
+// RAMUsage returns current RAM used and total in GB.
 func RAMUsage() (usedGB, totalGB float64) {
 	switch runtime.GOOS {
 	case "darwin":
@@ -279,10 +308,10 @@ func RAMUsage() (usedGB, totalGB float64) {
 				totalGB = float64(bytes) / (1024 * 1024 * 1024)
 			}
 		}
-
+		// vm_stat gives page-level memory info on macOS
 		if out, err := exec.Command("vm_stat").Output(); err == nil {
 			var active, wired, compressed uint64
-			pageSize := uint64(16384)
+			pageSize := uint64(16384) // Apple Silicon default
 			if ps := sysctl("hw.pagesize"); ps != "" {
 				if v, err := strconv.ParseUint(ps, 10, 64); err == nil {
 					pageSize = v
@@ -324,7 +353,7 @@ func RAMUsage() (usedGB, totalGB float64) {
 }
 
 func parseVMStatValue(line string) uint64 {
-
+	// "Pages active:    123456." → 123456
 	parts := strings.SplitN(line, ":", 2)
 	if len(parts) < 2 {
 		return 0
@@ -335,6 +364,8 @@ func parseVMStatValue(line string) uint64 {
 	return v
 }
 
+// OllamaModels returns the list of models currently pulled in Ollama.
+// Returns nil if Ollama is not installed or not running.
 func OllamaModels() []string {
 	out, err := commandOutput("ollama", "list")
 	if err != nil {
@@ -343,7 +374,7 @@ func OllamaModels() []string {
 	var models []string
 	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if i == 0 {
-			continue
+			continue // skip header
 		}
 		fields := strings.Fields(line)
 		if len(fields) > 0 {
@@ -353,6 +384,7 @@ func OllamaModels() []string {
 	return models
 }
 
+// RuntimeCapabilities returns what job types this host can serve.
 func RuntimeCapabilities() []string {
 	var caps []string
 	if commandRuns("ollama", "--version") {
@@ -376,6 +408,7 @@ func commandRuns(name string, args ...string) bool {
 	return exec.CommandContext(ctx, name, args...).Run() == nil
 }
 
+// splitCSV splits a comma-separated nvidia-smi line and trims each field.
 func splitCSV(line string) []string {
 	parts := strings.Split(line, ",")
 	for i := range parts {

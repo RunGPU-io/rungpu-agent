@@ -1,3 +1,7 @@
+// Package pool implements the agent's connection to the coordinator over raw
+// WebSocket: outbound dial (NAT/firewall friendly), register, heartbeat, and a
+// job loop that executes assignments and reports results. Reconnects with
+// backoff on disconnect.
 package pool
 
 import (
@@ -17,12 +21,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/RunGPU-io/rungpu-agent/internal/config"
 	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
 	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
 	"github.com/RunGPU-io/rungpu-agent/internal/job"
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
-	"github.com/gorilla/websocket"
 )
 
 func log(format string, args ...interface{}) {
@@ -36,10 +40,13 @@ func shortJobRef(jobID string) string {
 	return jobID
 }
 
+// WebSocket keepalive tuning. The agent pings periodically; if no pong (or any
+// other frame) arrives within pongWait the read fails and we reconnect — so a
+// half-open TCP connection is detected in ~1 minute instead of hanging.
 const (
 	writeWait  = 10 * time.Second
 	pongWait   = 60 * time.Second
-	pingPeriod = 50 * time.Second
+	pingPeriod = 50 * time.Second // must be < pongWait
 )
 
 type Client struct {
@@ -50,11 +57,14 @@ type Client struct {
 	backend     string
 	deviceIndex int
 
+	// baseCtx is the process-lifetime context; jobs run under it (not the
+	// per-connection session ctx) so a brief reconnect doesn't abort them.
 	baseCtx context.Context
-
+	// outbox carries job results/progress and is drained by whichever session
+	// is currently connected, so results survive a reconnect.
 	outbox chan interface{}
 
-	activeJobs      int64
+	activeJobs      int64 // atomic
 	cleanupRunning  int32
 	jobSlot         chan struct{}
 	outboxDir       string
@@ -148,6 +158,8 @@ func newClientForGPU(cfg *types.Config, deviceIndex int, maintenanceGate *sync.R
 	}
 	c.loadPendingResults()
 
+	// Relay job progress to the coordinator (best-effort — dropped if the outbox
+	// is full, so slow delivery never blocks inference).
 	executor.OnProgress = func(p types.JobProgress) {
 		log("job %s: stage=%s progress=%.0f%%", shortJobRef(p.JobID), p.Stage, p.Progress*100)
 		c.enqueue(p)
@@ -165,6 +177,7 @@ func deterministicGPUID(machineID string, deviceIndex int) string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// enqueue queues a message for delivery, dropping it if the outbox is full.
 func (c *Client) enqueue(msg interface{}) {
 	select {
 	case c.outbox <- msg:
@@ -172,6 +185,9 @@ func (c *Client) enqueue(msg interface{}) {
 	}
 }
 
+// RunCustomAssetCleanup removes expired machine-level custom assets only while
+// all GPU clients are idle. A single loop must be used for clients sharing a
+// cache directory.
 func RunCustomAssetCleanup(ctx context.Context, cfg *types.Config, clients []*Client) {
 	if cfg.CleanupIntervalHours <= 0 ||
 		(cfg.CustomAssetTTLDays < 0 && cfg.MaxCustomAssetCacheGB < 0) {
@@ -234,9 +250,11 @@ func pruneCustomAssetsIfIdle(cfg *types.Config, clients []*Client, now time.Time
 	return files, bytes, false, err
 }
 
+// Run connects and serves until ctx is cancelled, reconnecting with backoff.
 func (c *Client) Run(ctx context.Context) error {
 	c.baseCtx = ctx
-
+	// On shutdown, tear down any containers/workspaces still running so we don't
+	// leave detached containers holding the GPU.
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -319,6 +337,7 @@ func (c *Client) watchEarning(parent context.Context) (context.Context, context.
 	return ctx, cancel
 }
 
+// session runs one full connection lifecycle.
 func (c *Client) session(parent context.Context) error {
 	endpoint, err := c.endpoint()
 	if err != nil {
@@ -338,13 +357,19 @@ func (c *Client) session(parent context.Context) error {
 
 	log("connected to pool as %s", c.gpuID)
 
+	// Session-scoped channel for register/heartbeat (these belong to this
+	// connection). Job results/progress go through the persistent c.outbox.
 	sendCh := make(chan interface{}, 16)
 	go c.writer(ctx, conn, sendCh)
 
+	// Register immediately.
 	c.trySend(ctx, sendCh, c.registerMessage())
 
+	// Heartbeat loop.
 	go c.heartbeatLoop(ctx, sendCh)
 
+	// Read loop (blocks until disconnect/error). A read deadline plus pong
+	// handler detects a dead peer even when no application frames arrive.
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -355,7 +380,7 @@ func (c *Client) session(parent context.Context) error {
 			cancel()
 			return err
 		}
-
+		// Any inbound frame proves liveness — extend the deadline.
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 		c.dispatch(ctx, sendCh, data)
 	}
@@ -384,7 +409,8 @@ func (c *Client) writer(ctx context.Context, conn *websocket.Conn, sendCh <-chan
 			}
 		case msg := <-c.outbox:
 			if !write(msg) {
-
+				// Delivery failed (disconnect). Requeue so the next session
+				// delivers the result rather than losing it, then exit.
 				c.enqueue(msg)
 				return
 			}
@@ -415,6 +441,7 @@ func (c *Client) heartbeatLoop(ctx context.Context, sendCh chan<- interface{}) {
 	}
 }
 
+// dispatch routes an inbound message.
 func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data []byte) {
 	var env types.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -511,9 +538,9 @@ func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data [
 			}
 		}()
 	case "gpu_register_ack", "gpu_heartbeat_ack", "pool_metrics":
-
+		// informational; ignore
 	default:
-
+		// unknown; ignore
 	}
 }
 
@@ -531,14 +558,16 @@ func (c *Client) runJob(a types.JobAssignment, hasMaintenanceLease bool) {
 		source = "RunGPU customer"
 	}
 	log("received job %s from %s: model=%q runtime=%s custom_assets=%d workspace=%t", jobRef, source, a.ModelName, c.executor.Runtime(), len(a.CustomFiles), a.Workspace)
-
+	// Run under the process-lifetime context so a reconnect doesn't abort the
+	// job. Cancellation still happens via the executor (job_cancel / shutdown).
 	result := c.executor.Execute(c.baseCtx, a)
 	if result.Success {
 		log("job %s completed in %dms", jobRef, result.DurationMS)
 	} else {
 		log("job %s failed after %dms", jobRef, result.DurationMS)
 	}
-
+	// Deliver via the persistent outbox (blocking, so the result is never
+	// dropped — it waits for a live session if we're momentarily disconnected).
 	if err := c.persistResult(result); err != nil {
 		log("could not persist result for job %s: %v", a.JobID, err)
 	}
@@ -586,6 +615,8 @@ func (c *Client) loadPendingResults() {
 	}
 }
 
+// ── Message builders ──────────────────────────────────────────────────────────
+
 func (c *Client) registerMessage() types.RegisterMessage {
 	gpus := c.monitor.GPUs()
 	var name, driver string
@@ -625,7 +656,7 @@ func (c *Client) heartbeatMessage() types.HeartbeatMessage {
 		if m.MemoryTotalMB > 0 {
 			availGB = float64(m.MemoryTotalMB-m.MemoryUsedMB) / 1024.0
 		}
-		break
+		break // primary GPU
 	}
 	return types.HeartbeatMessage{
 		Type:            "gpu_heartbeat",
@@ -651,6 +682,9 @@ func (c *Client) cachedModels() []string {
 	return models
 }
 
+// endpoint converts the configured pool URL into a ws(s):// agent endpoint
+// with a non-secret GPU identity query parameter. Authentication is sent in
+// the Authorization header during the WebSocket upgrade.
 func (c *Client) endpoint() (string, error) {
 	u, err := url.Parse(c.cfg.PoolURL)
 	if err != nil {
@@ -676,6 +710,7 @@ func (c *Client) endpoint() (string, error) {
 	return u.String(), nil
 }
 
+// trySend pushes a message unless the context is done.
 func (c *Client) trySend(ctx context.Context, sendCh chan<- interface{}, msg interface{}) {
 	select {
 	case <-ctx.Done():

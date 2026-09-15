@@ -21,6 +21,7 @@ func TestPolicyFromConfig(t *testing.T) {
 		t.Fatalf("trusted registries not mapped: %+v", p.TrustedRegistries)
 	}
 
+	// A config-added registry is honored by ValidateImage alongside the defaults.
 	if err := ValidateImage("mycorp.example.com/model:v1", p); err != nil {
 		t.Errorf("config trusted registry should pass: %v", err)
 	}
@@ -51,6 +52,7 @@ func TestValidateImageTrusted(t *testing.T) {
 func TestValidateImageUntrusted(t *testing.T) {
 	policy := DefaultPolicy()
 
+	// Untrusted registries should be rejected
 	untrusted := []string{
 		"evil.io/cryptominer:latest",
 		"randomuser/malicious-image:v1",
@@ -82,6 +84,7 @@ func TestValidateImageCoordinatorAssigned(t *testing.T) {
 func TestValidateImageAllowAny(t *testing.T) {
 	policy := SecurityPolicy{AllowAnyImage: true}
 
+	// With AllowAnyImage, everything passes
 	if err := ValidateImage("evil.io/anything:latest", policy); err != nil {
 		t.Errorf("AllowAnyImage should allow everything: %v", err)
 	}
@@ -104,10 +107,12 @@ func TestValidateImageCustomTrusted(t *testing.T) {
 func TestValidateImageDockerHubShorthand(t *testing.T) {
 	policy := DefaultPolicy()
 
+	// "ubuntu" → "docker.io/library/ubuntu" → trusted
 	if err := ValidateImage("ubuntu", policy); err != nil {
 		t.Errorf("Docker Hub official image should be trusted: %v", err)
 	}
 
+	// "pytorch/pytorch" → "docker.io/pytorch/pytorch" → trusted
 	if err := ValidateImage("pytorch/pytorch:2.0", policy); err != nil {
 		t.Errorf("pytorch official should be trusted: %v", err)
 	}
@@ -144,13 +149,14 @@ func TestValidateMountsAllowed(t *testing.T) {
 }
 
 func TestValidateMountsSubstringBypass(t *testing.T) {
-
+	// Paths that merely CONTAIN "cache"/"staging"/etc. as a substring but are
+	// NOT under the agent's ~/.tokenize tree must stay blocked.
 	blocked := []string{
 		"/etc/cache:/cache",
 		"/root/staging:/data",
 		"/usr/output:/out",
 		"/proc/workspaces:/ws",
-		"/home/tokenize/x:/x",
+		"/home/tokenize/x:/x", // "tokenize" segment without the leading dot
 	}
 	for _, mount := range blocked {
 		if err := ValidateMounts([]string{mount}); err == nil {
@@ -160,13 +166,14 @@ func TestValidateMountsSubstringBypass(t *testing.T) {
 }
 
 func TestSandboxArgsHostNetwork(t *testing.T) {
-
+	// Default policy must NOT use host networking.
 	for i, a := range SandboxArgs(DefaultPolicy()) {
 		if a == "--network" {
 			t.Fatalf("default policy must not set --network (got %v)", SandboxArgs(DefaultPolicy())[i:])
 		}
 	}
 
+	// Explicitly allowed → --network host present.
 	args := SandboxArgs(SecurityPolicy{AllowHostNetwork: true})
 	found := false
 	for i, a := range args {
@@ -183,6 +190,7 @@ func TestSandboxArgs(t *testing.T) {
 	policy := DefaultPolicy()
 	args := SandboxArgs(policy)
 
+	// Must contain no-new-privileges
 	found := false
 	for i, a := range args {
 		if a == "--security-opt" && i+1 < len(args) && args[i+1] == "no-new-privileges" {
@@ -193,6 +201,7 @@ func TestSandboxArgs(t *testing.T) {
 		t.Error("sandbox args must include --security-opt no-new-privileges")
 	}
 
+	// Must contain pids-limit
 	foundPids := false
 	for i, a := range args {
 		if a == "--pids-limit" && i+1 < len(args) {

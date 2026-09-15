@@ -22,6 +22,8 @@ func TestParseEnrollmentInput(t *testing.T) {
 		{name: "windows command", in: `.\rungpu-agent-windows-amd64.exe init --enrollment-token enroll_win`, want: "enroll_win"},
 		{name: "mac command", in: "./rungpu-agent-darwin-arm64 init --enrollment-token enroll_mac", want: "enroll_mac"},
 		{name: "equals form", in: "rungpu-agent init --enrollment-token=enroll_eq", want: "enroll_eq"},
+		{name: "linux gui command", in: "rungpu-agent gui\nrungpu-agent init --enrollment-token enroll_linux", want: "enroll_linux"},
+		{name: "multiline bootstrap", in: "rungpu-agent init --enrollment-token enroll_boot\nrungpu-agent setup\nrungpu-agent start", want: "enroll_boot"},
 		{name: "empty", in: "   ", want: ""},
 	}
 	for _, test := range tests {
@@ -90,5 +92,144 @@ func TestCmdUnenrollDeletesConfig(t *testing.T) {
 	}
 	if err := cmdUnenroll([]string{"--config", path}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func isolateAgentHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	return home
+}
+
+func writeAgentConfig(t *testing.T, home, body string) string {
+	t.Helper()
+	dir := filepath.Join(home, ".tokenize")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestGUIServesHTML(t *testing.T) {
+	ctrl := &guiController{}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	ctrl.handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"RunGPU Agent", `id="pause"`, `id="resume"`, `id="enroll"`, "Enrollment token"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("html missing %q", want)
+		}
+	}
+}
+
+func TestGUIStateWhenUnenrolled(t *testing.T) {
+	isolateAgentHome(t)
+	ctrl := &guiController{}
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	rec := httptest.NewRecorder()
+	ctrl.handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["enrolled"] != false {
+		t.Fatalf("enrolled = %v", body["enrolled"])
+	}
+	if body["paused"] != false {
+		t.Fatalf("paused = %v", body["paused"])
+	}
+}
+
+func TestGUIPauseResumeRoundTrip(t *testing.T) {
+	home := isolateAgentHome(t)
+	writeAgentConfig(t, home, "api_key: test-key\nmachine_id: test-machine\n")
+	ctrl := &guiController{running: true}
+
+	pause := httptest.NewRecorder()
+	ctrl.handler().ServeHTTP(pause, httptest.NewRequest(http.MethodPost, "/api/pause", nil))
+	if pause.Code != http.StatusOK {
+		t.Fatalf("pause status = %d body=%s", pause.Code, pause.Body.String())
+	}
+	var paused map[string]any
+	if err := json.Unmarshal(pause.Body.Bytes(), &paused); err != nil {
+		t.Fatal(err)
+	}
+	if paused["enrolled"] != true || paused["paused"] != true {
+		t.Fatalf("after pause: %+v", paused)
+	}
+
+	resume := httptest.NewRecorder()
+	ctrl.handler().ServeHTTP(resume, httptest.NewRequest(http.MethodPost, "/api/resume", nil))
+	if resume.Code != http.StatusOK {
+		t.Fatalf("resume status = %d body=%s", resume.Code, resume.Body.String())
+	}
+	var resumed map[string]any
+	if err := json.Unmarshal(resume.Body.Bytes(), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed["paused"] != false {
+		t.Fatalf("paused should be false after resume: %+v", resumed)
+	}
+}
+
+func TestGUIScheduleUpdatesConfig(t *testing.T) {
+	home := isolateAgentHome(t)
+	path := writeAgentConfig(t, home, "api_key: test-key\nmachine_id: test-machine\n")
+	ctrl := &guiController{running: true}
+	req := httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(`{"enabled":true,"timezone":"America/Los_Angeles","windows":[{"start_hour":9,"end_hour":17,"days":["mon","tue"]}]}`))
+	rec := httptest.NewRecorder()
+	ctrl.handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "enabled: true") || !strings.Contains(text, "America/Los_Angeles") {
+		t.Fatalf("schedule not saved: %s", text)
+	}
+}
+
+func TestCmdPauseResume(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("api_key: test\nmachine_id: test-id\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdPause([]string{"--config", path}); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(paused), "paused: true") {
+		t.Fatalf("pause did not persist: %s", paused)
+	}
+	if err := cmdResume([]string{"--config", path}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(resumed), "paused: false") {
+		t.Fatalf("resume did not persist: %s", resumed)
 	}
 }

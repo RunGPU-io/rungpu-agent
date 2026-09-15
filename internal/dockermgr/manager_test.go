@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+// argValue returns the argument immediately following the first occurrence of
+// flag in args, or "" if the flag is absent / has no value.
 func argValue(args []string, flag string) string {
 	for i, a := range args {
 		if a == flag && i+1 < len(args) {
@@ -27,10 +29,12 @@ func hasFlag(args []string, flag string) bool {
 func TestBuildRunArgsGPUScoping(t *testing.T) {
 	m := New()
 
+	// No GPU → no --gpus flag at all.
 	if got := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "c", UseGPU: false}); hasFlag(got, "--gpus") {
 		t.Errorf("UseGPU=false should not add --gpus, got %v", got)
 	}
 
+	// GPU with no device / "all" → --gpus all.
 	for _, dev := range []string{"", "all", "ALL", "  "} {
 		args := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "c", Network: "none", UseGPU: true, GPUDevice: dev})
 		if v := argValue(args, "--gpus"); v != "all" {
@@ -38,6 +42,7 @@ func TestBuildRunArgsGPUScoping(t *testing.T) {
 		}
 	}
 
+	// GPU with a specific device → --gpus device=<id>.
 	args := m.buildRunArgs(RunOptions{Image: "ubuntu", Name: "c", Network: "none", UseGPU: true, GPUDevice: "1"})
 	if v := argValue(args, "--gpus"); v != "device=1" {
 		t.Errorf("GPUDevice=1 → --gpus %q, want device=1", v)
@@ -76,6 +81,7 @@ func TestBuildRunArgsComposition(t *testing.T) {
 		}
 	}
 
+	// Image must precede its command, and the command comes last.
 	if args[len(args)-1] != "serve" {
 		t.Errorf("command should be last arg, got %q", args[len(args)-1])
 	}

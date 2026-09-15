@@ -1,8 +1,11 @@
+// Package config loads/saves the agent YAML config and creates a default
+// config (including GPU auto-detection) on `init`.
 package config
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +19,8 @@ import (
 
 const DefaultPoolURL = "https://rungpu-pool-api-420004393585.us-central1.run.app"
 
+// DefaultConfigPath returns the cross-platform default config location:
+// ~/.tokenize/config.yaml (Windows: %USERPROFILE%\.tokenize\config.yaml).
 func DefaultConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -24,6 +29,54 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".tokenize", "config.yaml")
 }
 
+// LoadOrCreateInstallationID returns a stable, non-secret ID used to make
+// batch enrollment retries idempotent before the machine has credentials.
+func LoadOrCreateInstallationID(configPath string) (string, error) {
+	path := filepath.Join(filepath.Dir(configPath), "installation-id")
+	if existing, err := os.ReadFile(path); err == nil {
+		id := strings.TrimSpace(string(existing))
+		if id != "" {
+			return id, nil
+		}
+	}
+	id, err := randomUUID()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(id+"\n"), 0600); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// LoadOrCreateInstallationSecret returns a private random value proving that a
+// batch retry comes from the installation that claimed the original slot.
+func LoadOrCreateInstallationSecret(configPath string) (string, error) {
+	path := filepath.Join(filepath.Dir(configPath), "installation-secret")
+	if existing, err := os.ReadFile(path); err == nil {
+		secret := strings.TrimSpace(string(existing))
+		if secret != "" {
+			return secret, nil
+		}
+	}
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	secret := base64.RawURLEncoding.EncodeToString(random)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0600); err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+// New builds a default config, auto-detecting local GPUs.
 func New(apiKey string) (*types.Config, error) {
 	machineID, err := randomUUID()
 	if err != nil {
@@ -94,12 +147,15 @@ func RefreshGPUIDs(cfg *types.Config) {
 	}
 }
 
+// Load reads and parses a config file. Warns if the file has insecure
+// permissions (the config contains a machine-scoped credential).
 func Load(path string) (*types.Config, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("config file not found at %s: %w", path, err)
 	}
 
+	// Check permissions on Unix — warn if group/other can read the credential.
 	if mode := info.Mode().Perm(); configPermissionsNeedWarning(runtime.GOOS, mode) {
 		fmt.Fprintf(os.Stderr,
 			"WARNING: config file %s has permissions %o — should be 600 (contains a machine credential).\n"+
@@ -121,6 +177,9 @@ func configPermissionsNeedWarning(goos string, mode os.FileMode) bool {
 	return goos != "windows" && mode.Perm()&0o077 != 0
 }
 
+// Save writes the config to disk with helpful comments, creating parent
+// directories as needed. The file is written with 0600 permissions since it
+// contains the machine credential.
 func Save(cfg *types.Config, path string) error {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -128,10 +187,13 @@ func Save(cfg *types.Config, path string) error {
 		}
 	}
 
+	// Write a commented config so users can easily edit it.
 	content := generateCommentedConfig(cfg)
 	return os.WriteFile(path, []byte(content), 0o600)
 }
 
+// generateCommentedConfig produces a human-readable YAML config with inline
+// documentation for every field. This is what `init` writes and what users edit.
 func generateCommentedConfig(cfg *types.Config) string {
 	gpuIDs := ""
 	for _, id := range cfg.GPUIDs {
@@ -282,6 +344,8 @@ security:
 	)
 }
 
+// ApplyDefaults fills in any missing fields with sensible defaults so a
+// minimal config (just api_key) is enough to start the agent.
 func ApplyDefaults(cfg *types.Config) {
 	if key := strings.TrimSpace(os.Getenv("RUNGPU_AGENT_KEY")); key != "" {
 		cfg.APIKey = key
@@ -368,11 +432,12 @@ func formatScheduleWindows(sched types.ScheduleConfig) string {
 	return b.String()
 }
 
+// Validate checks required fields.
 func Validate(cfg *types.Config) error {
 	if cfg.APIKey == "" {
 		return fmt.Errorf("machine credential is empty — enroll this host or set RUNGPU_AGENT_KEY")
 	}
-
+	// Auto-fill everything else so a minimal config works.
 	ApplyDefaults(cfg)
 	return nil
 }

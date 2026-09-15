@@ -1,3 +1,19 @@
+// Package dockermgr — security.go enforces container sandboxing rules.
+//
+// Threat model: a renter submits a malicious Docker image that tries to:
+//   - Access the host filesystem outside allowed mounts
+//   - Escalate privileges (--privileged, host PID/network)
+//   - Run a crypto miner indefinitely
+//   - Exfiltrate host data via network
+//   - Mount sensitive host paths (/etc, /root, /var/run/docker.sock)
+//
+// Mitigations:
+//  1. Image allowlist — official public bases, host extras, or the one image this job assigned
+//  2. Container sandboxing — no --privileged, no host network, no host PID
+//  3. Mount restrictions — only agent-controlled paths, never host system dirs
+//  4. Resource limits — CPU, memory, timeout
+//  5. Read-only root filesystem option
+//  6. No new privileges (security-opt)
 package dockermgr
 
 import (
@@ -8,6 +24,8 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
+// TrustedRegistries are generic public bases only. Managed product images are
+// not listed here — the coordinator assigns those per job (CoordinatorImage).
 var TrustedRegistries = []string{
 	"docker.io/library/",
 	"jupyter/",
@@ -15,6 +33,7 @@ var TrustedRegistries = []string{
 	"nvcr.io/nvidia/",
 }
 
+// BlockedMountPaths are host paths that must NEVER be mounted into a container.
 var BlockedMountPaths = []string{
 	"/",
 	"/etc",
@@ -30,24 +49,27 @@ var BlockedMountPaths = []string{
 	"/bin",
 	"/sbin",
 	"/lib",
-	"/tmp",
+	"/tmp", // could contain agent config with API key
 }
 
+// SecurityPolicy controls what containers are allowed to do.
 type SecurityPolicy struct {
-	AllowAnyImage     bool
-	TrustedRegistries []string
-	MaxMemoryGB       int
-	MaxCPUs           float64
-	TimeoutMinutes    int
-	AllowHostNetwork  bool
-	CoordinatorImage  string
+	AllowAnyImage     bool     // if true, skip image allowlist (host opts in to risk)
+	TrustedRegistries []string // additional trusted registries beyond defaults
+	MaxMemoryGB       int      // container memory limit (0 = no limit)
+	MaxCPUs           float64  // container CPU limit (0 = no limit)
+	TimeoutMinutes    int      // max container runtime (0 = no limit)
+	AllowHostNetwork  bool   // if true, allow --network host (dangerous)
+	CoordinatorImage  string // the single image this authenticated job assigned
 }
 
+// WithAssignedImage allows one coordinator-assigned image for this job only.
 func WithAssignedImage(policy SecurityPolicy, image string) SecurityPolicy {
 	policy.CoordinatorImage = strings.TrimSpace(image)
 	return policy
 }
 
+// DefaultPolicy returns a secure default policy.
 func DefaultPolicy() SecurityPolicy {
 	return SecurityPolicy{
 		AllowAnyImage:     false,
@@ -59,6 +81,8 @@ func DefaultPolicy() SecurityPolicy {
 	}
 }
 
+// PolicyFromConfig maps the host's YAML security config onto a SecurityPolicy.
+// The built-in TrustedRegistries always apply; config only adds to them.
 func PolicyFromConfig(c types.SecurityConfig) SecurityPolicy {
 	return SecurityPolicy{
 		AllowAnyImage:     c.AllowAnyImage,
@@ -69,6 +93,7 @@ func PolicyFromConfig(c types.SecurityConfig) SecurityPolicy {
 	}
 }
 
+// ValidateImage checks if a Docker image is from a trusted registry.
 func ValidateImage(image string, policy SecurityPolicy) error {
 	if policy.AllowAnyImage {
 		return nil
@@ -77,6 +102,7 @@ func ValidateImage(image string, policy SecurityPolicy) error {
 		return nil
 	}
 
+	// Normalize: docker.io images may omit the registry prefix
 	normalized := normalizeImage(image)
 
 	allTrusted := append(TrustedRegistries, policy.TrustedRegistries...)
@@ -103,6 +129,9 @@ func normalizeImage(image string) string {
 	return image
 }
 
+// imageMatchesTrusted reports whether image is covered by a trusted entry.
+// Registry prefixes end with "/". Digest pins contain "@sha256:". Bare image
+// names must match exactly or be followed by a tag (":") or digest ("@").
 func imageMatchesTrusted(image, trusted string) bool {
 	if trusted == "" {
 		return false
@@ -113,6 +142,7 @@ func imageMatchesTrusted(image, trusted string) bool {
 	return image == trusted || strings.HasPrefix(image, trusted+":") || strings.HasPrefix(image, trusted+"@")
 }
 
+// ValidateMounts checks that no mount path accesses sensitive host directories.
 func ValidateMounts(mounts []string) error {
 	for _, mount := range mounts {
 		parts := strings.SplitN(mount, ":", 2)
@@ -123,7 +153,10 @@ func ValidateMounts(mounts []string) error {
 
 		for _, blocked := range BlockedMountPaths {
 			if hostPath == blocked || strings.HasPrefix(hostPath, blocked+"/") {
-
+				// Exception: the agent's own directories live under ~/.tokenize
+				// (which may itself sit under a blocked root like /home or /root).
+				// Match a real ".tokenize" path *segment* — not a substring — so
+				// paths like "/etc/cache" or "/root/staging" stay blocked.
 				if isAgentControlledPath(hostPath) {
 					continue
 				}
@@ -134,6 +167,8 @@ func ValidateMounts(mounts []string) error {
 	return nil
 }
 
+// isAgentControlledPath reports whether hostPath sits inside the agent's own
+// ~/.tokenize tree, by matching a ".tokenize" path *segment* (not a substring).
 func isAgentControlledPath(hostPath string) bool {
 	for _, seg := range strings.Split(filepath.ToSlash(hostPath), "/") {
 		if seg == ".tokenize" {
@@ -143,12 +178,16 @@ func isAgentControlledPath(hostPath string) bool {
 	return false
 }
 
+// SandboxArgs returns Docker CLI arguments that sandbox the container.
+// These are always applied — the renter cannot override them.
 func SandboxArgs(policy SecurityPolicy) []string {
 	args := []string{
-		"--security-opt", "no-new-privileges",
-		"--pids-limit", "4096",
+		"--security-opt", "no-new-privileges", // prevent privilege escalation
+		"--pids-limit", "4096", // prevent fork bombs
 	}
 
+	// Only opt into host networking when explicitly allowed; otherwise the
+	// container uses its own network namespace (Docker's default bridge).
 	if policy.AllowHostNetwork {
 		args = append(args, "--network", "host")
 	}

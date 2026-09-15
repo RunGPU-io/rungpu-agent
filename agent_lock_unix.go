@@ -9,6 +9,8 @@ import (
 	"syscall"
 )
 
+// acquireAgentProcessLock prevents a second agent process from tearing down
+// containers owned by the active process during startup reconciliation.
 func acquireAgentProcessLock() (func(), error) {
 	home, err := os.UserHomeDir()
 	if err != nil {

@@ -12,38 +12,48 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
+// Executor runs one coordinator assignment: pull the assigned image, stage
+// verified files, run the container, upload output if asked, and return the result.
 type Executor struct {
 	runtime    Runtime
 	gpuID      string
 	backend    string
 	cacheDir   string
 	jobTimeout time.Duration
-	OnProgress func(types.JobProgress)
+	OnProgress func(types.JobProgress) // set by pool client
 
+	// Teardown/tracking: `inflight` holds cancel funcs for jobs currently
+	// executing; `workspaces` holds job ids whose detached workspace container
+	// is still running (so it can be stopped on cancel/shutdown). `teardown`
+	// stops containers by their deterministic name.
 	mu         sync.Mutex
 	inflight   map[string]context.CancelFunc
 	workspaces map[string]bool
 	teardown   *dockermgr.Manager
 }
 
+// ExecutorOptions configures a new Executor.
 type ExecutorOptions struct {
 	CacheDir           string
 	MaxCacheGB         int
 	GPUID              string
 	Backend            string
-	GPUDevice          string
-	JobTimeout         time.Duration
-	MaxCustomFileBytes int64
-	Policy             dockermgr.SecurityPolicy
-	HFToken            string
+	GPUDevice          string                   // scope containers to a GPU (see types.Config)
+	JobTimeout         time.Duration            // batch job cap; 0 → 60m
+	MaxCustomFileBytes int64                    // per-file download cap; 0 → unlimited
+	Policy             dockermgr.SecurityPolicy // container sandbox policy
+	HFToken            string                   // HuggingFace token for gated downloads
 }
 
+// NewExecutor builds an executor with default execution options.
 func NewExecutor(cacheDir string, maxCacheGB int, gpuID, backend string) (*Executor, error) {
 	return NewExecutorWithOptions(ExecutorOptions{
 		CacheDir: cacheDir, MaxCacheGB: maxCacheGB, GPUID: gpuID, Backend: backend,
 	})
 }
 
+// NewExecutorWithOptions builds an executor whose Runtime matches the backend,
+// honoring GPU scoping, job timeout, and download caps.
 func NewExecutorWithOptions(o ExecutorOptions) (*Executor, error) {
 	if o.JobTimeout <= 0 {
 		o.JobTimeout = 60 * time.Minute
@@ -83,10 +93,13 @@ func (e *Executor) WorkspaceIDs() []string {
 	return ids
 }
 
+// Execute runs a single job end-to-end and returns a JobResult ready to send.
 func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.JobResult {
 	start := time.Now()
 	res := types.JobResult{Type: "job_result", JobID: a.JobID, GPUID: e.gpuID}
 
+	// Wrap in a cancelable context registered by job id so a job_cancel message
+	// (or shutdown) can interrupt this job.
 	jobCtx, cancel := context.WithCancel(ctx)
 	e.trackInflight(a.JobID, cancel)
 	workspace := a.Runtime == "workspace"
@@ -98,7 +111,8 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	}
 	defer func() {
 		e.untrackInflight(a.JobID)
-
+		// Keep workspace containers registered on success so they can be torn
+		// down later; a failed/aborted workspace leaves nothing running.
 		if workspace && res.Success {
 			e.markWorkspace(a.JobID)
 		}
@@ -106,6 +120,7 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 	}()
 	ctx = jobCtx
 
+	// ── Stage 1: Stage the assigned workflow and download verified files ─
 	stagingDir := e.cacheDir + "/staging/" + a.JobID
 	if a.WorkflowJSON != "" {
 		if err := StageInlineWorkflow(a.WorkflowJSON, a.WorkflowSHA256, stagingDir); err != nil {
@@ -127,6 +142,7 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 		}
 	}
 
+	// ── Stage 2: Prepare (pull image / download model) ──────────────────
 	e.progress(a.JobID, "pulling_image", 0, "Preparing model...")
 	if err := e.runtime.Prepare(ctx, a); err != nil {
 		res.Success = false
@@ -135,6 +151,7 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 		return res
 	}
 
+	// ── Stage 3: Run inference ──────────────────────────────────────────
 	e.progress(a.JobID, "running", 0.5, "Running inference...")
 	out, err := e.runtime.Run(ctx, a)
 	res.DurationMS = elapsedMilliseconds(start)
@@ -144,9 +161,10 @@ func (e *Executor) Execute(ctx context.Context, a types.JobAssignment) types.Job
 		return res
 	}
 
+	// ── Stage 4: Upload output (if upload URL provided) ─────────────────
 	if a.UploadURL != "" {
 		e.progress(a.JobID, "uploading", 0.9, "Uploading output...")
-
+		// Look for output file path in the result
 		if outputPath, ok := out["output_file"].(string); ok && outputPath != "" {
 			if uploadErr := UploadOutput(ctx, outputPath, a.UploadURL); uploadErr != nil {
 				res.Success = false
@@ -197,9 +215,12 @@ func (e *Executor) progress(jobID, stage string, pct float64, msg string) {
 	}
 }
 
+// CleanupModels delegates cache cleanup to the active runtime.
 func (e *Executor) CleanupModels(force bool) error {
 	return e.runtime.Cleanup(force)
 }
+
+// ── Job tracking / cancellation ──────────────────────────────────────────────
 
 func (e *Executor) trackInflight(jobID string, cancel context.CancelFunc) {
 	e.mu.Lock()
@@ -225,6 +246,8 @@ func (e *Executor) markWorkspace(jobID string) {
 	e.workspaces[jobID] = true
 }
 
+// Cancel stops a running job and tears down any container it started
+// (batch or workspace). Idempotent and safe to call for unknown job ids.
 func (e *Executor) Cancel(jobID string) {
 	e.cancelWithContext(context.Background(), jobID)
 }
@@ -238,6 +261,8 @@ func (e *Executor) cancelWithContext(ctx context.Context, jobID string) {
 	delete(e.workspaces, jobID)
 	e.mu.Unlock()
 
+	// Stop+remove by deterministic name. Only one of these exists per job; the
+	// other is a no-op. Uses Background so teardown isn't tied to any request.
 	if e.teardown == nil {
 		e.teardown = dockermgr.New()
 	}
@@ -250,6 +275,8 @@ func (e *Executor) cancelWithContext(ctx context.Context, jobID string) {
 	}
 }
 
+// StopAll cancels every tracked job and tears down its containers. Called on
+// agent shutdown so no detached workspace container is left holding the GPU.
 func (e *Executor) StopAll(ctx context.Context) {
 	e.mu.Lock()
 	ids := make(map[string]bool, len(e.inflight)+len(e.workspaces))
