@@ -15,8 +15,6 @@ var (
 
 const errorAlreadyExists syscall.Errno = 183
 
-// acquireAgentProcessLock uses a process-lifetime named mutex. Unlike a lock
-// file it is released by Windows even if the agent crashes.
 func acquireAgentProcessLock() (func(), error) {
 	name, err := syscall.UTF16PtrFromString(`Local\RunGPUAgent`)
 	if err != nil {

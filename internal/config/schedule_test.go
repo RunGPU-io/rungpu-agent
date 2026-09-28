@@ -51,7 +51,7 @@ func TestEvaluateEarningModes(t *testing.T) {
 }
 
 func TestEvaluateEarningWeeklyAndMultipleWindows(t *testing.T) {
-	thursday := time.Date(2026, 9, 3, 20, 0, 0, 0, time.UTC) // Thursday
+	thursday := time.Date(2026, 9, 3, 20, 0, 0, 0, time.UTC)
 	weekday := types.ScheduleConfig{
 		Enabled:  true,
 		Timezone: "UTC",

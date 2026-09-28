@@ -1,22 +1,10 @@
-// Command rungpu-agent is the cross-platform GPU agent that contributes a
-// host's GPU(s) to the RunGPU pool. It connects outbound over WebSocket,
-// registers, heartbeats, and runs inference jobs in Docker.
-//
-// Usage:
-//
-//	rungpu-agent
-//	rungpu-agent gui
-//	rungpu-agent init --enrollment-token TOKEN [--config PATH]
-//	rungpu-agent init --batch-token-file PATH [--config PATH]
-//	rungpu-agent start [--config PATH]
-//	rungpu-agent status [--config PATH]
-//	rungpu-agent cleanup [--all] [--containers] [--volumes] [--images] [--cache] [--ollama] [--config-file] [--service] [--dry-run]
 package main
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -39,11 +27,6 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
-// version is injected by the GitHub release workflow with:
-//
-//	-ldflags "-X main.version=${GITHUB_REF_NAME}"
-//
-// Keep "dev" for local source builds.
 var version = "dev"
 
 var (
@@ -272,10 +255,6 @@ Commands:
 Run "tokenize-gpu-agent <command> -h" for command flags.`)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// init
-// ═══════════════════════════════════════════════════════════════════════════════
-
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	enrollmentToken := fs.String("enrollment-token", "", "one-time fleet enrollment token")
@@ -287,43 +266,7 @@ func cmdInit(args []string) error {
 	if (*enrollmentToken == "") == (*batchTokenFile == "") {
 		return fmt.Errorf("provide exactly one of --enrollment-token or --batch-token-file")
 	}
-	var enrolled *enrollmentResponse
-	var err error
-	if *batchTokenFile != "" {
-		tokenBytes, readErr := readBatchTokenFile(*batchTokenFile)
-		if readErr != nil {
-			return fmt.Errorf("read batch token file: %w", readErr)
-		}
-		installationID, installationErr := config.LoadOrCreateInstallationID(*cfgPath)
-		if installationErr != nil {
-			return fmt.Errorf("create installation identity: %w", installationErr)
-		}
-		installationSecret, secretErr := config.LoadOrCreateInstallationSecret(*cfgPath)
-		if secretErr != nil {
-			return fmt.Errorf("create installation secret: %w", secretErr)
-		}
-		hostname, hostnameErr := os.Hostname()
-		if hostnameErr != nil || hostname == "" {
-			hostname = "rungpu-host"
-		}
-		enrolled, err = enrollMachineBatch(*poolURL, strings.TrimSpace(string(tokenBytes)), installationID, installationSecret, hostname)
-	} else {
-		enrolled, err = enrollMachine(*poolURL, *enrollmentToken)
-	}
-	if err != nil {
-		return err
-	}
-
-	cfg, err := config.New(enrolled.AgentKey)
-	if err != nil {
-		return err
-	}
-	cfg.PoolURL = *poolURL
-	cfg.MachineID = enrolled.MachineID
-	cfg.PricePerMinute = enrolled.PricePerMinute
-	cfg.ContributeFree = enrolled.PricePerMinute == 0
-	config.RefreshGPUIDs(cfg)
-	if err := config.Save(cfg, *cfgPath); err != nil {
+	if err := initializeEnrollment(*poolURL, *enrollmentToken, *batchTokenFile, *cfgPath); err != nil {
 		return err
 	}
 
@@ -333,25 +276,140 @@ func cmdInit(args []string) error {
 	}
 	start := startCommand(runtime.GOOS, filepath.Base(executable))
 	setup := setupCommand(runtime.GOOS, filepath.Base(executable))
-	fmt.Println()
-	fmt.Println("Enrollment successful. This machine is connected to RunGPU.")
-	fmt.Printf("Credentials saved to: %s\n", *cfgPath)
-	fmt.Println("Start the agent now with:")
-	fmt.Printf("  %s\n", start)
+	printEnrollmentSuccess(*cfgPath, start)
 
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	return enrollmentDiagnostics(start, setup, *cfgPath, cfg)
+}
+
+func printEnrollmentSuccess(cfgPath, start string) {
+	fmt.Println()
+	fmt.Println("Enrollment successful. This machine is enrolled with RunGPU.")
+	fmt.Printf("Credentials saved to: %s\n", cfgPath)
+	fmt.Println("Start the agent to connect to the pool:")
+	fmt.Printf("  %s\n", start)
+}
+
+func initializeEnrollment(poolURL, enrollmentToken, batchTokenFile, cfgPath string) error {
+	unlock, err := config.LockEnrollment(cfgPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := config.PreflightSave(cfgPath); err != nil {
+		return fmt.Errorf("cannot persist credentials at %s; fix the config path/permissions before retrying (no enrollment request sent): %w", cfgPath, err)
+	}
+	var existing *types.Config
+	if batchTokenFile == "" {
+		existing, err = singleEnrollmentConfig(cfgPath, poolURL)
+		if err != nil {
+			return fmt.Errorf("%w (no enrollment request sent)", err)
+		}
+	}
+	installationID, err := config.LoadOrCreateInstallationID(cfgPath)
+	if err != nil {
+		return fmt.Errorf("prepare installation identity (no enrollment request sent): %w", err)
+	}
+	installationSecret, err := config.LoadOrCreateInstallationSecret(cfgPath)
+	if err != nil {
+		return fmt.Errorf("prepare installation secret (no enrollment request sent): %w", err)
+	}
+	var enrolled *enrollmentResponse
+	if batchTokenFile != "" {
+		tokenBytes, readErr := readBatchTokenFile(batchTokenFile)
+		if readErr != nil {
+			return fmt.Errorf("read batch token file: %w", readErr)
+		}
+		hostname, hostnameErr := os.Hostname()
+		if hostnameErr != nil || hostname == "" {
+			hostname = "rungpu-host"
+		}
+		enrolled, err = enrollMachineBatch(poolURL, strings.TrimSpace(string(tokenBytes)), installationID, installationSecret, hostname)
+	} else {
+		enrolled, err = enrollMachine(poolURL, enrollmentToken, installationID, installationSecret)
+	}
+	if err != nil {
+		return fmt.Errorf("%w; retry the same enrollment command/token using config path %s and its original installation-id/installation-secret files; do not delete them. Single-token delivery recovery lasts 7 days; if expired or replaced, request Replace enrollment in the dashboard", err, cfgPath)
+	}
+
+	if batchTokenFile == "" {
+		current, loadErr := singleEnrollmentConfig(cfgPath, poolURL)
+		if loadErr != nil {
+			return fmt.Errorf("server enrollment succeeded but local config was preserved: %w; retain the original token and installation-id/installation-secret for recovery within 7 days", loadErr)
+		}
+		for _, saved := range []*types.Config{existing, current} {
+			if saved != nil && saved.MachineID != "" && saved.MachineID != enrolled.MachineID {
+				return fmt.Errorf("server enrollment returned machine %s, but config %s belongs to machine %s; existing config was preserved. Use the token for this machine (dashboard Replace enrollment), or restore the intended installation's original config path and installation-id/installation-secret files; do not overwrite another enrollment", enrolled.MachineID, cfgPath, saved.MachineID)
+			}
+		}
+		existing = current
+	} else {
+		existing, _ = config.Load(cfgPath)
+	}
+
+	if existing != nil &&
+		existing.MachineID == enrolled.MachineID && existing.APIKey == enrolled.AgentKey &&
+		sameEnrollmentPool(existing.PoolURL, poolURL) {
+		return nil
+	}
+	cfg := existing
+	if cfg == nil || batchTokenFile != "" {
+		cfg, err = config.New(enrolled.AgentKey)
+		if err != nil {
+			return fmt.Errorf("server enrollment succeeded but preparing local config failed: %w; retry the SAME token with config path %s and preserve installation-id/installation-secret (single-token recovery: 7 days)", err, cfgPath)
+		}
+	}
+	cfg.PoolURL = poolURL
+	cfg.APIKey = enrolled.AgentKey
+	cfg.MachineID = enrolled.MachineID
+	cfg.PricePerMinute = enrolled.PricePerMinute
+	cfg.ContributeFree = enrolled.PricePerMinute == 0
+	config.RefreshGPUIDs(cfg)
+	if err := config.Save(cfg, cfgPath); err != nil {
+		return fmt.Errorf("server enrollment succeeded but saving credentials at %s failed: %w; fix local persistence and retry the SAME token with this config path; preserve installation-id and installation-secret (single-token recovery: 7 days)", cfgPath, err)
+	}
+	return nil
+}
+
+func sameEnrollmentPool(saved, requested string) bool {
+	if saved == "" {
+		saved = config.DefaultPoolURL
+	}
+	return strings.TrimRight(saved, "/") == strings.TrimRight(requested, "/")
+}
+
+func singleEnrollmentConfig(cfgPath, poolURL string) (*types.Config, error) {
+	existing, err := config.Load(cfgPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot safely read existing config %s: %w; restore or repair it before enrollment", cfgPath, err)
+	}
+	if !sameEnrollmentPool(existing.PoolURL, poolURL) {
+		return nil, fmt.Errorf("config %s belongs to a different pool; existing config was preserved. Use its original --pool-url, or the intended installation's original --config path and installation files", cfgPath)
+	}
+	if existing.APIKey != "" && existing.MachineID == "" {
+		return nil, fmt.Errorf("config %s has a credential but no machine ID; existing config was preserved. Restore its machine ID before using this machine's replacement enrollment token", cfgPath)
+	}
+	return existing, nil
+}
+
+func enrollmentDiagnostics(start, setup, cfgPath string, cfg *types.Config) error {
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
 	fmt.Println("║           RunGPU Agent — Setup & Diagnostics            ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
-	// ── Step 1: Check prerequisites ─────────────────────────────────────
 	fmt.Println("Step 1/4 — Checking prerequisites...")
 	fmt.Println()
 
 	issues := 0
 
-	// Docker
 	dockerOk := exec.Command("docker", "version").Run() == nil
 	if dockerOk {
 		fmt.Println("  ✅ Docker            installed")
@@ -361,7 +419,6 @@ func cmdInit(args []string) error {
 		issues++
 	}
 
-	// NVIDIA GPU / nvidia-smi
 	nvidiaOk := false
 	if out, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output(); err == nil {
 		gpuName := strings.TrimSpace(string(out))
@@ -377,7 +434,6 @@ func cmdInit(args []string) error {
 		fmt.Println("     → Install NVIDIA drivers: https://www.nvidia.com/drivers")
 	}
 
-	// NVIDIA Container Toolkit (Linux only)
 	if runtime.GOOS == "linux" && dockerOk {
 		nctOk := exec.Command("docker", "run", "--rm", "--gpus", "all", "nvidia/cuda:12.0.0-base-ubuntu22.04", "nvidia-smi").Run() == nil
 		if nctOk {
@@ -388,7 +444,6 @@ func cmdInit(args []string) error {
 		}
 	}
 
-	// Ollama
 	ollamaOk := exec.Command("ollama", "--version").Run() == nil
 	if ollamaOk {
 		fmt.Println("  ✅ Ollama            installed (LLM inference)")
@@ -397,10 +452,9 @@ func cmdInit(args []string) error {
 		fmt.Println("     → Install: https://ollama.com")
 	}
 
-	// Disk space
 	home, _ := os.UserHomeDir()
 	if stat, err := os.Stat(home); err == nil && stat.IsDir() {
-		// Simple check: can we write to the cache dir?
+
 		cacheDir := filepath.Join(home, ".tokenize", "models")
 		os.MkdirAll(cacheDir, 0755)
 		testFile := filepath.Join(cacheDir, ".write-test")
@@ -423,7 +477,6 @@ func cmdInit(args []string) error {
 		fmt.Println()
 	}
 
-	// ── Step 2: Detect GPUs ─────────────────────────────────────────────
 	fmt.Println("Step 2/4 — Detecting GPUs...")
 	fmt.Println()
 
@@ -439,15 +492,13 @@ func cmdInit(args []string) error {
 	}
 	fmt.Println()
 
-	// ── Step 3: Create config ───────────────────────────────────────────
 	fmt.Println("Step 3/4 — Creating configuration...")
 	fmt.Println()
-	fmt.Printf("  ✅ Config saved to: %s\n", *cfgPath)
+	fmt.Printf("  ✅ Config saved to: %s\n", cfgPath)
 	fmt.Printf("  ✅ Pool URL: %s\n", cfg.PoolURL)
 	fmt.Printf("  ✅ Machine ID: %s\n", cfg.MachineID)
 	fmt.Println()
 
-	// ── Step 4: Next steps ──────────────────────────────────────────────
 	fmt.Println("Step 4/4 — Ready!")
 	fmt.Println()
 	fmt.Println("  ┌─────────────────────────────────────────────────────┐")
@@ -579,26 +630,22 @@ type enrollmentResponse struct {
 	PricePerMinute float64 `json:"price_per_minute"`
 }
 
-func enrollMachine(poolURL, token string) (*enrollmentResponse, error) {
-	base, err := url.Parse(poolURL)
+func enrollMachine(poolURL, token, installationID, installationSecret string) (*enrollmentResponse, error) {
+	base, err := enrollmentURL(poolURL, "/api/v1/fleet/enroll")
 	if err != nil {
 		return nil, fmt.Errorf("invalid pool URL: %w", err)
 	}
-	if base.Scheme != "https" {
-		host := base.Hostname()
-		ip := net.ParseIP(host)
-		if base.Scheme != "http" || (host != "localhost" && (ip == nil || !ip.IsLoopback())) {
-			return nil, fmt.Errorf("fleet enrollment requires HTTPS except on localhost")
-		}
-	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/api/v1/fleet/enroll"
-	body, _ := json.Marshal(map[string]string{"enrollment_token": token})
+	body, _ := json.Marshal(map[string]string{
+		"enrollment_token": token, "installation_id": installationID, "installation_secret": installationSecret,
+	})
 	req, err := http.NewRequest(http.MethodPost, base.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fleet enrollment failed: %w", err)
@@ -670,10 +717,6 @@ func enrollmentURL(poolURL, endpoint string) (*url.URL, error) {
 	return base, nil
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// start
-// ═══════════════════════════════════════════════════════════════════════════════
-
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
@@ -701,24 +744,8 @@ func cmdStart(args []string) error {
 		}
 	}
 
-	// Containers normally disappear when jobs finish or the agent shuts down.
-	// A host crash/SIGKILL can bypass those defers and leave an agent-owned
-	// workspace holding loopback port 8188 (or another requested port). Reconcile
-	// only tokenize-* containers before accepting new work. `setup` deliberately
-	// does not do this because installing prerequisites must not stop workloads.
-	dockerProbeCtx, cancelDockerProbe := context.WithTimeout(context.Background(), 10*time.Second)
-	dockerAvailable := exec.CommandContext(dockerProbeCtx, "docker", "version").Run() == nil
-	cancelDockerProbe()
-	if dockerAvailable {
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
-		removed, cleanupErr := dockermgr.New().RemoveAllTokenizeContainers(cleanupCtx)
-		cancelCleanup()
-		if cleanupErr != nil {
-			return fmt.Errorf("remove stale agent runtime containers before start: %w", cleanupErr)
-		}
-		if removed > 0 {
-			fmt.Printf("Removed %d stale agent container(s); released their ports and GPU resources.\n", removed)
-		}
+	if err := prepareExecutionRecovery(cfg, *cfgPath); err != nil {
+		return err
 	}
 
 	fmt.Println("Detecting GPU and runtime capabilities...")
@@ -765,10 +792,6 @@ func cmdStart(args []string) error {
 	fmt.Println("Agent stopped.")
 	return nil
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// status
-// ═══════════════════════════════════════════════════════════════════════════════
 
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
@@ -854,20 +877,6 @@ func runtimeReadiness(backend string, capabilities []string) (string, bool) {
 	return required, false
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// cleanup — comprehensive cleanup for host agent users
-//
-// Cleans up everything the agent creates on the host machine:
-//   - Docker containers (tokenize-*)
-//   - Docker named volumes (tokenize-* model caches)
-//   - Docker images (workspace/model images)
-//   - Local file cache (staging, output, models)
-//   - Ollama models
-//   - Config file (~/.tokenize/)
-//   - System service (launchd / systemd)
-//   - Log files
-// ═══════════════════════════════════════════════════════════════════════════════
-
 func cmdCleanup(args []string) error {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	fs.Usage = func() {
@@ -900,11 +909,10 @@ Examples:
 	dryRun := fs.Bool("dry-run", false, "show what would be removed without actually removing")
 	_ = fs.Parse(args)
 
-	// If no specific flags, default to dry-run overview
 	nothingSelected := !*all && !*containers && !*volumes && !*images && !*cache && !*ollama && !*configFile && !*service && !*logs
 	if nothingSelected {
 		*dryRun = true
-		// Show everything
+
 		*all = true
 	}
 
@@ -934,7 +942,6 @@ Examples:
 
 	totalCleaned := 0
 
-	// ── 1. Docker containers ────────────────────────────────────────────
 	if *containers && hasDocker {
 		cleaned, err := cleanupContainers(ctx, docker, *dryRun)
 		if err != nil {
@@ -943,7 +950,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 2. Docker named volumes ─────────────────────────────────────────
 	if *volumes && hasDocker {
 		cleaned, err := cleanupVolumes(ctx, docker, *dryRun)
 		if err != nil {
@@ -952,7 +958,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 3. Docker images ────────────────────────────────────────────────
 	if *images && hasDocker {
 		cleaned, err := cleanupImages(ctx, docker, *dryRun)
 		if err != nil {
@@ -961,7 +966,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 4. Local file cache ─────────────────────────────────────────────
 	if *cache {
 		cleaned, err := cleanupCache(*dryRun)
 		if err != nil {
@@ -970,7 +974,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 5. Ollama models ────────────────────────────────────────────────
 	if *ollama {
 		cleaned, err := cleanupOllama(*dryRun)
 		if err != nil {
@@ -979,7 +982,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 6. Config file ──────────────────────────────────────────────────
 	if *configFile {
 		cleaned, err := cleanupConfig(*dryRun)
 		if err != nil {
@@ -988,7 +990,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 7. System service ───────────────────────────────────────────────
 	if *service {
 		cleaned, err := cleanupService(*dryRun)
 		if err != nil {
@@ -997,7 +998,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── 8. Log files ────────────────────────────────────────────────────
 	if *logs {
 		cleaned, err := cleanupLogs(*dryRun)
 		if err != nil {
@@ -1006,7 +1006,6 @@ Examples:
 		totalCleaned += cleaned
 	}
 
-	// ── Summary ─────────────────────────────────────────────────────────
 	fmt.Println()
 	if *dryRun && nothingSelected {
 		fmt.Println("To remove specific resources:")
@@ -1029,8 +1028,6 @@ Examples:
 
 	return nil
 }
-
-// ── Cleanup: Docker containers ──────────────────────────────────────────────
 
 func cleanupContainers(ctx context.Context, docker *dockermgr.Manager, dryRun bool) (int, error) {
 	containers, err := docker.ListTokenizeContainers(ctx)
@@ -1062,8 +1059,6 @@ func cleanupContainers(ctx context.Context, docker *dockermgr.Manager, dryRun bo
 	return removed, err
 }
 
-// ── Cleanup: Docker named volumes ─────────��─────────────────────────────────
-
 func cleanupVolumes(ctx context.Context, docker *dockermgr.Manager, dryRun bool) (int, error) {
 	volumes, err := docker.ListTokenizeVolumes(ctx)
 	if err != nil {
@@ -1085,7 +1080,6 @@ func cleanupVolumes(ctx context.Context, docker *dockermgr.Manager, dryRun bool)
 		return len(volumes), nil
 	}
 
-	// Must remove containers first before volumes
 	docker.RemoveAllTokenizeContainers(ctx)
 
 	removed := 0
@@ -1099,8 +1093,6 @@ func cleanupVolumes(ctx context.Context, docker *dockermgr.Manager, dryRun bool)
 	fmt.Printf("  → Removed %d volume(s)\n", removed)
 	return removed, nil
 }
-
-// ── Cleanup: Docker images ──────────────────────────────────────────────────
 
 func cleanupImages(ctx context.Context, docker *dockermgr.Manager, dryRun bool) (int, error) {
 	images, err := docker.ListTokenizeImages(ctx)
@@ -1134,8 +1126,6 @@ func cleanupImages(ctx context.Context, docker *dockermgr.Manager, dryRun bool) 
 	fmt.Printf("  → Removed %d image(s)\n", removed)
 	return removed, nil
 }
-
-// ── Cleanup: Local file cache ───────────────────────────────────────────────
 
 func cleanupCache(dryRun bool) (int, error) {
 	home, _ := os.UserHomeDir()
@@ -1188,8 +1178,6 @@ func cleanupCache(dryRun bool) (int, error) {
 	return removed, nil
 }
 
-// ── Cleanup: Ollama models ──────────────────────────────────────────────────
-
 func cleanupOllama(dryRun bool) (int, error) {
 	fmt.Printf("Ollama models:\n")
 
@@ -1205,11 +1193,11 @@ func cleanupOllama(dryRun bool) (int, error) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	// First line is header
+
 	models := []string{}
 	for i, line := range lines {
 		if i == 0 {
-			continue // skip header
+			continue
 		}
 		fields := strings.Fields(line)
 		if len(fields) > 0 {
@@ -1244,8 +1232,6 @@ func cleanupOllama(dryRun bool) (int, error) {
 	return removed, nil
 }
 
-// ── Cleanup: Config file ────────────────────────────────────────────────────
-
 func cleanupConfig(dryRun bool) (int, error) {
 	home, _ := os.UserHomeDir()
 	configDir := filepath.Join(home, ".tokenize")
@@ -1259,7 +1245,7 @@ func cleanupConfig(dryRun bool) (int, error) {
 	}
 
 	entries, _ := os.ReadDir(configDir)
-	// Only count config-related files, not model cache (handled separately)
+
 	configFiles := []string{}
 	for _, e := range entries {
 		name := e.Name()
@@ -1287,7 +1273,6 @@ func cleanupConfig(dryRun bool) (int, error) {
 		}
 	}
 
-	// If the directory is now empty (or only has dirs we already cleaned), remove it
 	remaining, _ := os.ReadDir(configDir)
 	if len(remaining) == 0 {
 		os.Remove(configDir)
@@ -1296,8 +1281,6 @@ func cleanupConfig(dryRun bool) (int, error) {
 	fmt.Printf("  → Removed %d config file(s)\n", removed)
 	return removed, nil
 }
-
-// ── Cleanup: System service ─────────────────────────────────────────────────
 
 func cleanupService(dryRun bool) (int, error) {
 	fmt.Printf("System service:\n")
@@ -1329,7 +1312,6 @@ func cleanupServiceMacOS(dryRun bool) (int, error) {
 		return 1, nil
 	}
 
-	// Unload first (ignore errors — may already be unloaded)
 	exec.Command("launchctl", "unload", plist).Run()
 
 	if err := os.Remove(plist); err != nil {
@@ -1368,8 +1350,6 @@ func cleanupServiceLinux(dryRun bool) (int, error) {
 	return 1, nil
 }
 
-// ── Cleanup: Log files ──────────────────────────────────────────────────────
-
 func cleanupLogs(dryRun bool) (int, error) {
 	fmt.Printf("Log files:\n")
 
@@ -1377,13 +1357,11 @@ func cleanupLogs(dryRun bool) (int, error) {
 
 	home, _ := os.UserHomeDir()
 
-	// macOS log location
 	macLog := filepath.Join(home, "Library", "Logs", "tokenize-gpu-agent.log")
 	if _, err := os.Stat(macLog); err == nil {
 		logFiles = append(logFiles, macLog)
 	}
 
-	// Common log locations
 	commonLogs := []string{
 		"/var/log/tokenize-gpu-agent.log",
 		filepath.Join(home, ".tokenize", "agent.log"),
@@ -1424,9 +1402,6 @@ func cleanupLogs(dryRun bool) (int, error) {
 	return removed, nil
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-// dirStats returns total size in bytes and file count for a directory.
 func dirStats(path string) (int64, int) {
 	var totalSize int64
 	var count int
@@ -1443,7 +1418,6 @@ func dirStats(path string) (int64, int) {
 	return totalSize, count
 }
 
-// humanSize formats bytes into a human-readable string.
 func humanSize(bytes int64) string {
 	const (
 		KB = 1024

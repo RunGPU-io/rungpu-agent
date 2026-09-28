@@ -12,14 +12,14 @@ import (
 
 func TestParseCoordinatorDrive(t *testing.T) {
 	drive := parseCoordinatorDrive(map[string]interface{}{
-		"_drive_script":     "print(1)",
-		"_entrypoint":       "python",
-		"_command":          []interface{}{"-c", "pass"},
-		"_output_mount":     "/app/out",
-		"_use_host_memory":  true,
-		"_extra_env":        map[string]interface{}{"HF_HUB_OFFLINE": "1"},
-		"_stage_mounts":     []interface{}{map[string]interface{}{"from": "models", "to": "/models", "ro": true}},
-		"timeout_minutes":   "10",
+		"_drive_script":    "print(1)",
+		"_entrypoint":      "python",
+		"_command":         []interface{}{"-c", "pass"},
+		"_output_mount":    "/app/out",
+		"_use_host_memory": true,
+		"_extra_env":       map[string]interface{}{"HF_HUB_OFFLINE": "1"},
+		"_stage_mounts":    []interface{}{map[string]interface{}{"from": "models", "to": "/models", "ro": true}},
+		"timeout_minutes":  "10",
 	})
 	if drive.Script != "print(1)" || drive.Entrypoint != "python" || drive.OutputMount != "/app/out" || !drive.UseHostMemory {
 		t.Fatalf("drive = %+v", drive)
@@ -52,6 +52,35 @@ func TestParseCoordinatorDriveRejectsTraversalMount(t *testing.T) {
 func TestCoordinatorParamsAreNotCopiedToEnv(t *testing.T) {
 	if !isCoordinatorParam("_drive_script") || isCoordinatorParam("timeout_minutes") {
 		t.Fatal("coordinator param detection")
+	}
+}
+
+func TestBuildContainerEnvPreservesReservedValues(t *testing.T) {
+	assignment := types.JobAssignment{
+		JobID:     "job-123",
+		ModelName: "managed-model",
+		Input:     map[string]interface{}{"prompt": "hello"},
+		Parameters: map[string]interface{}{
+			"job_id":     "attacker-job",
+			"model_name": "attacker-model",
+			"input_data": "attacker-input",
+			"seed":       "42",
+		},
+	}
+	drive := coordinatorDrive{ExtraEnv: map[string]string{
+		"JOB_ID":         "coordinator-job",
+		"MODEL_NAME":     "coordinator-model",
+		"INPUT_DATA":     "coordinator-input",
+		"HF_HUB_OFFLINE": "1",
+	}}
+
+	env := buildContainerEnv(assignment, drive)
+	if env["JOB_ID"] != assignment.JobID || env["MODEL_NAME"] != assignment.ModelName ||
+		env["INPUT_DATA"] != `{"prompt":"hello"}` {
+		t.Fatalf("reserved environment was overwritten: %v", env)
+	}
+	if env["SEED"] != "42" || env["HF_HUB_OFFLINE"] != "1" {
+		t.Fatalf("ordinary environment was not preserved: %v", env)
 	}
 }
 

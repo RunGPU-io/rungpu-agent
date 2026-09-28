@@ -42,14 +42,35 @@ func resolveJobImage(a types.JobAssignment) (string, error) {
 	return ResolveImage(a)
 }
 
+func buildContainerEnv(a types.JobAssignment, drive coordinatorDrive) map[string]string {
+	env := map[string]string{}
+	if a.Parameters != nil {
+		for key, value := range a.Parameters {
+			if key == "docker_image" || key == "workspace" || isCoordinatorParam(key) {
+				continue
+			}
+			if text, ok := value.(string); ok {
+				env[strings.ToUpper(key)] = text
+			}
+		}
+	}
+	for key, value := range drive.ExtraEnv {
+		env[key] = value
+	}
+
+	inputJSON, _ := json.Marshal(a.Input)
+	env["JOB_ID"] = a.JobID
+	env["MODEL_NAME"] = a.ModelName
+	env["INPUT_DATA"] = string(inputJSON)
+	return env
+}
+
 func (r *customDockerRuntime) Prepare(ctx context.Context, a types.JobAssignment) error {
 	img, err := resolveJobImage(a)
 	if err != nil {
 		return err
 	}
 
-	// Enforce the image allowlist BEFORE pulling — otherwise a job could make
-	// the host pull an arbitrary (large/untrusted) image before Run rejects it.
 	if err := dockermgr.ValidateImage(img, dockermgr.WithAssignedImage(r.docker.Policy, img)); err != nil {
 		return fmt.Errorf("security: %w", err)
 	}
@@ -58,7 +79,6 @@ func (r *customDockerRuntime) Prepare(ctx context.Context, a types.JobAssignment
 		return fmt.Errorf("docker is not available — install Docker to run custom model images")
 	}
 
-	// Pull the image if not already present (cached)
 	if !r.imageExists(ctx, img) {
 		cmd := exec.CommandContext(ctx, "docker", "pull", img)
 		if out, pullErr := cmd.CombinedOutput(); pullErr != nil {
@@ -78,31 +98,16 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 		return nil, err
 	}
 
-	inputJSON, _ := json.Marshal(a.Input)
 	containerName := CustomContainerName(a.JobID)
+	if a.ResourceName != "" {
+		containerName = a.ResourceName
+	}
 
 	drive := parseCoordinatorDrive(a.Parameters)
-	env := map[string]string{
-		"JOB_ID":     a.JobID,
-		"MODEL_NAME": a.ModelName,
-		"INPUT_DATA": string(inputJSON),
-	}
-	if a.Parameters != nil {
-		for k, v := range a.Parameters {
-			if k == "docker_image" || k == "workspace" || isCoordinatorParam(k) {
-				continue
-			}
-			if s, ok := v.(string); ok {
-				env[strings.ToUpper(k)] = s
-			}
-		}
-	}
-	for key, value := range drive.ExtraEnv {
-		env[key] = value
-	}
+	env := buildContainerEnv(a, drive)
 
 	stagingDir := filepath.Join(r.cacheDir, "staging", a.JobID)
-	mounts := BuildMounts(r.cacheDir, stagingDir, a.CustomFiles)
+	mounts := BuildMounts(stagingDir, a.CustomFiles)
 	if assignmentNeedsCustomMount(a, drive) && !hasCustomMount(mounts) {
 		mounts = append(mounts, stagingDir+":/custom:ro")
 	}
@@ -117,30 +122,31 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	}
 	mounts = applyStageMounts(mounts, stagingDir, drive.StageMounts)
 
-	volumes := []string{
-		"tokenize-model-cache:/models",
-	}
-
 	if _, runErr := r.docker.Run(ctx, dockermgr.RunOptions{
-		Image:         img,
-		Name:          containerName,
-		Network:       "none",
-		UseGPU:        r.useGPU,
-		GPUDevice:     r.gpuDevice,
-		Mounts:        mounts,
-		Volumes:       volumes,
-		Env:           env,
-		ShmSize:       "8g",
-		Entrypoint:    drive.Entrypoint,
-		Command:       drive.Command,
-		UseHostMemory: drive.UseHostMemory,
+		Image:            img,
+		Name:             containerName,
+		Labels:           a.ResourceLabels,
+		ExpectedDaemonID: a.ResourceDaemonID,
+		Network:          "none",
+		UseGPU:           r.useGPU,
+		GPUDevice:        r.gpuDevice,
+		Mounts:           mounts,
+		Env:              env,
+		ShmSize:          "8g",
+		Entrypoint:       drive.Entrypoint,
+		Command:          drive.Command,
+		UseHostMemory:    drive.UseHostMemory,
 	}); runErr != nil {
 		return nil, fmt.Errorf("failed to start container %s: %w", img, runErr)
 	}
 
 	defer func() {
-		_ = r.docker.Stop(context.Background(), containerName)
-		_ = r.docker.Remove(context.Background(), containerName)
+		if a.ResourceName != "" {
+			_ = r.docker.RemoveOwnedAndVerify(context.Background(), dockermgr.OwnedResource{Name: containerName, Labels: a.ResourceLabels, DaemonID: a.ResourceDaemonID})
+		} else {
+			_ = r.docker.Stop(context.Background(), containerName)
+			_ = r.docker.Remove(context.Background(), containerName)
+		}
 	}()
 
 	if drive.Script != "" {
@@ -179,7 +185,6 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	parsed["backend"] = "docker-custom"
 	parsed["image"] = img
 
-	// Check for output files in the output dir
 	if outputFile := findOutputFile(outputDir); outputFile != "" {
 		parsed["output_file"] = outputFile
 	}
@@ -189,8 +194,6 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 
 func (r *customDockerRuntime) Cleanup(force bool) error { return nil }
 
-// jobTimeoutFor permits a renter to request a shorter timeout, never one above
-// the host-configured maximum.
 func (r *customDockerRuntime) jobTimeoutFor(a types.JobAssignment) time.Duration {
 	requested := time.Duration(0)
 	if a.Parameters != nil {
@@ -245,7 +248,6 @@ func (r *customDockerRuntime) waitForCompletion(ctx context.Context, name string
 	}
 }
 
-// findOutputFile looks for the first media file in the output directory.
 func findOutputFile(dir string) string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -264,14 +266,13 @@ func findOutputFile(dir string) string {
 			}
 		}
 	}
-	// Fallback: return first file
+
 	if len(entries) > 0 && !entries[0].IsDir() {
 		return filepath.Join(dir, entries[0].Name())
 	}
 	return ""
 }
 
-// parseOutput extracts the JSON object from the worker's "OUTPUT:{...}" line.
 func parseOutput(logs string) map[string]interface{} {
 	idx := strings.LastIndex(logs, "OUTPUT:")
 	if idx < 0 {

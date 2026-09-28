@@ -9,7 +9,24 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+func newTestGUIController() *guiController {
+	return &guiController{
+		lastPing:   time.Now(),
+		authority:  "127.0.0.1:32123",
+		origin:     "http://127.0.0.1:32123",
+		capability: "test-gui-capability",
+	}
+}
+
+func serveGUI(ctrl *guiController, rec *httptest.ResponseRecorder, req *http.Request) {
+	req.Host = ctrl.authority
+	req.Header.Set("Origin", ctrl.origin)
+	req.Header.Set("X-RunGPU-GUI-Token", ctrl.capability)
+	ctrl.handler().ServeHTTP(rec, req)
+}
 
 func TestParseEnrollmentInput(t *testing.T) {
 	tests := []struct {
@@ -36,10 +53,10 @@ func TestParseEnrollmentInput(t *testing.T) {
 }
 
 func TestGUIEnrollRejectsEmptyToken(t *testing.T) {
-	ctrl := &guiController{}
+	ctrl := newTestGUIController()
 	req := httptest.NewRequest(http.MethodPost, "/api/enroll", strings.NewReader(`{"token":""}`))
 	rec := httptest.NewRecorder()
-	ctrl.handler().ServeHTTP(rec, req)
+	serveGUI(ctrl, rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
@@ -62,6 +79,54 @@ func TestOnlyLoopbackRejectsRemote(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestGUIRejectsRequestsWithoutLaunchCapability(t *testing.T) {
+	ctrl := newTestGUIController()
+	req := httptest.NewRequest(http.MethodPost, "/api/stop", nil)
+	req.Host = ctrl.authority
+	req.Header.Set("Origin", ctrl.origin)
+	rec := httptest.NewRecorder()
+
+	ctrl.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestGUIRejectsCrossOriginAndWrongHost(t *testing.T) {
+	ctrl := newTestGUIController()
+	for _, test := range []struct {
+		name   string
+		host   string
+		origin string
+	}{
+		{name: "cross origin", host: ctrl.authority, origin: "https://attacker.example"},
+		{name: "wrong host", host: "attacker.example", origin: ctrl.origin},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/stop", nil)
+			req.Host = test.host
+			req.Header.Set("Origin", test.origin)
+			req.Header.Set("X-RunGPU-GUI-Token", ctrl.capability)
+			rec := httptest.NewRecorder()
+			ctrl.handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
+			}
+		})
+	}
+}
+
+func TestGUIMutationsRequirePost(t *testing.T) {
+	ctrl := newTestGUIController()
+	req := httptest.NewRequest(http.MethodGet, "/api/unenroll", nil)
+	rec := httptest.NewRecorder()
+	serveGUI(ctrl, rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 }
 
@@ -117,27 +182,54 @@ func writeAgentConfig(t *testing.T, home, body string) string {
 }
 
 func TestGUIServesHTML(t *testing.T) {
-	ctrl := &guiController{}
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	ctrl := newTestGUIController()
+	req := httptest.NewRequest(http.MethodGet, "/?token="+ctrl.capability, nil)
+	req.Host = ctrl.authority
 	rec := httptest.NewRecorder()
 	ctrl.handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"RunGPU Agent", `id="pause"`, `id="resume"`, `id="enroll"`, "Enrollment token"} {
+	for _, want := range []string{
+		"RunGPU Agent",
+		`id="pause"`,
+		`id="resume"`,
+		`id="enroll"`,
+		"Connect this computer",
+		"Open the host dashboard",
+		"Paste the token or the full init command",
+		"init --batch-token-file",
+		`api("/api/ping").then(render)`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("html missing %q", want)
 		}
 	}
 }
 
+func TestGUIPingRefreshesLease(t *testing.T) {
+	ctrl := newTestGUIController()
+	ctrl.lastPing = time.Now().Add(-time.Minute)
+	before := ctrl.lastPing
+	rec := httptest.NewRecorder()
+
+	serveGUI(ctrl, rec, httptest.NewRequest(http.MethodGet, "/api/ping", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !ctrl.lastPing.After(before) {
+		t.Fatal("ping did not refresh the GUI lease")
+	}
+}
+
 func TestGUIStateWhenUnenrolled(t *testing.T) {
 	isolateAgentHome(t)
-	ctrl := &guiController{}
+	ctrl := newTestGUIController()
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	rec := httptest.NewRecorder()
-	ctrl.handler().ServeHTTP(rec, req)
+	serveGUI(ctrl, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -156,10 +248,11 @@ func TestGUIStateWhenUnenrolled(t *testing.T) {
 func TestGUIPauseResumeRoundTrip(t *testing.T) {
 	home := isolateAgentHome(t)
 	writeAgentConfig(t, home, "api_key: test-key\nmachine_id: test-machine\n")
-	ctrl := &guiController{running: true}
+	ctrl := newTestGUIController()
+	ctrl.running = true
 
 	pause := httptest.NewRecorder()
-	ctrl.handler().ServeHTTP(pause, httptest.NewRequest(http.MethodPost, "/api/pause", nil))
+	serveGUI(ctrl, pause, httptest.NewRequest(http.MethodPost, "/api/pause", nil))
 	if pause.Code != http.StatusOK {
 		t.Fatalf("pause status = %d body=%s", pause.Code, pause.Body.String())
 	}
@@ -172,7 +265,7 @@ func TestGUIPauseResumeRoundTrip(t *testing.T) {
 	}
 
 	resume := httptest.NewRecorder()
-	ctrl.handler().ServeHTTP(resume, httptest.NewRequest(http.MethodPost, "/api/resume", nil))
+	serveGUI(ctrl, resume, httptest.NewRequest(http.MethodPost, "/api/resume", nil))
 	if resume.Code != http.StatusOK {
 		t.Fatalf("resume status = %d body=%s", resume.Code, resume.Body.String())
 	}
@@ -188,10 +281,11 @@ func TestGUIPauseResumeRoundTrip(t *testing.T) {
 func TestGUIScheduleUpdatesConfig(t *testing.T) {
 	home := isolateAgentHome(t)
 	path := writeAgentConfig(t, home, "api_key: test-key\nmachine_id: test-machine\n")
-	ctrl := &guiController{running: true}
+	ctrl := newTestGUIController()
+	ctrl.running = true
 	req := httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(`{"enabled":true,"timezone":"America/Los_Angeles","windows":[{"start_hour":9,"end_hour":17,"days":["mon","tue"]}]}`))
 	rec := httptest.NewRecorder()
-	ctrl.handler().ServeHTTP(rec, req)
+	serveGUI(ctrl, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}

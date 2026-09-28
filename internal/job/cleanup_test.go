@@ -11,8 +11,12 @@ func TestCleanupRemovesOnlySelectedFixedDirectories(t *testing.T) {
 	cacheDir := t.TempDir()
 	write := func(path string) {
 		t.Helper()
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil { t.Fatal(err) }
-		if err := os.WriteFile(path, []byte("asset"), 0o600); err != nil { t.Fatal(err) }
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("asset"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	write(filepath.Join(cacheDir, "assets", "lora.safetensors"))
 	write(filepath.Join(cacheDir, "staging", "job-1", "workflow.json"))
@@ -22,7 +26,9 @@ func TestCleanupRemovesOnlySelectedFixedDirectories(t *testing.T) {
 
 	executor := &Executor{cacheDir: cacheDir, inflight: map[string]context.CancelFunc{}}
 	preview, err := executor.PreviewCleanup([]string{"custom_assets", "job_files"})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if preview.TotalBytes == 0 || preview.Categories["custom_assets"].Items != 1 {
 		t.Fatalf("unexpected preview: %#v", preview)
 	}

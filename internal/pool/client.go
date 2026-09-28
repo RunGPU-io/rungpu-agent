@@ -1,13 +1,10 @@
-// Package pool implements the agent's connection to the coordinator over raw
-// WebSocket: outbound dial (NAT/firewall friendly), register, heartbeat, and a
-// job loop that executes assignments and reports results. Reconnects with
-// backoff on disconnect.
 package pool
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	stdlog "log"
 	"net"
@@ -21,12 +18,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/RunGPU-io/rungpu-agent/internal/config"
 	"github.com/RunGPU-io/rungpu-agent/internal/dockermgr"
 	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
 	"github.com/RunGPU-io/rungpu-agent/internal/job"
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/gorilla/websocket"
 )
 
 func log(format string, args ...interface{}) {
@@ -40,36 +37,67 @@ func shortJobRef(jobID string) string {
 	return jobID
 }
 
-// WebSocket keepalive tuning. The agent pings periodically; if no pong (or any
-// other frame) arrives within pongWait the read fails and we reconnect — so a
-// half-open TCP connection is detected in ~1 minute instead of hanging.
 const (
-	writeWait  = 10 * time.Second
-	pongWait   = 60 * time.Second
-	pingPeriod = 50 * time.Second // must be < pongWait
+	writeWait                 = 10 * time.Second
+	pongWait                  = 60 * time.Second
+	pingPeriod                = 50 * time.Second
+	registrationWait          = 30 * time.Second
+	maxDeferredAssignments    = 64
+	maxCancellationTombstones = 1024
 )
+
+var machineExecutionGate sync.RWMutex
+
+type cancellationTombstone struct {
+	knownUnstarted bool
+	stopVerified   bool
+}
 
 type Client struct {
 	cfg         *types.Config
 	monitor     *gpu.Monitor
-	executor    *job.Executor
+	executor    jobExecutor
 	gpuID       string
 	backend     string
 	deviceIndex int
 
-	// baseCtx is the process-lifetime context; jobs run under it (not the
-	// per-connection session ctx) so a brief reconnect doesn't abort them.
 	baseCtx context.Context
-	// outbox carries job results/progress and is drained by whichever session
-	// is currently connected, so results survive a reconnect.
+
 	outbox chan interface{}
 
-	activeJobs      int64 // atomic
-	cleanupRunning  int32
-	jobSlot         chan struct{}
-	outboxDir       string
-	maintenanceGate *sync.RWMutex
-	configPath      string
+	resultsMu    sync.Mutex
+	results      map[string]*pendingResult
+	resultsReady chan struct{}
+	cancelling   sync.Map
+
+	assignmentsMu               sync.Mutex
+	activeAssignment            string
+	activeDispatchToken         string
+	deferredAssignments         map[string]types.JobAssignment
+	settledAttempts             []string
+	cancellationTombstones      map[string]*cancellationTombstone
+	cancellationAdmissionFenced bool
+	executionJournal            *job.AttemptJournal
+	activeJobs                  int64
+	cleanupRunning              int32
+	jobSlot                     chan struct{}
+	outboxDir                   string
+	maintenanceGate             *sync.RWMutex
+	configPath                  string
+}
+
+type jobExecutor interface {
+	Start(context.Context, types.JobAssignment) (<-chan types.JobResult, error)
+	IsTracked(string) bool
+	TrackedDispatchToken(string) (string, bool)
+	Cancel(string) error
+	CancelAttempt(string, string) error
+	ForgetExecution(string)
+	StopAll(context.Context) error
+	Runtime() string
+	WorkspaceIDs() []string
+	PreviewCleanup([]string) (job.CleanupPreview, error)
+	ExecuteCleanup(context.Context, []string) (job.CleanupPreview, error)
 }
 
 func (c *Client) SetConfigPath(path string) {
@@ -100,7 +128,7 @@ func NewClients(cfg *types.Config) ([]*Client, error) {
 		count = 1
 	}
 	clients := make([]*Client, 0, count)
-	maintenanceGate := &sync.RWMutex{}
+	maintenanceGate := &machineExecutionGate
 	for position := 0; position < count; position++ {
 		deviceIndex := position
 		if position < len(detected) {
@@ -116,7 +144,7 @@ func NewClients(cfg *types.Config) ([]*Client, error) {
 }
 
 func NewClientForGPU(cfg *types.Config, deviceIndex int) (*Client, error) {
-	return newClientForGPU(cfg, deviceIndex, &sync.RWMutex{})
+	return newClientForGPU(cfg, deviceIndex, &machineExecutionGate)
 }
 
 func newClientForGPU(cfg *types.Config, deviceIndex int, maintenanceGate *sync.RWMutex) (*Client, error) {
@@ -136,35 +164,104 @@ func newClientForGPU(cfg *types.Config, deviceIndex int, maintenanceGate *sync.R
 		MaxCustomFileBytes: int64(cfg.MaxCustomFileGB) * 1024 * 1024 * 1024,
 		Policy:             dockermgr.PolicyFromConfig(cfg.Security),
 		HFToken:            cfg.Security.HFToken,
+		ExecutionGate:      maintenanceGate,
+		ExpectedJournalID:  cfg.ExecutionJournalID,
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	return clientWithExecutor(cfg, gpuID, backend, deviceIndex, monitor, maintenanceGate, executor)
+}
+
+func clientWithExecutor(cfg *types.Config, gpuID, backend string, deviceIndex int, monitor *gpu.Monitor, maintenanceGate *sync.RWMutex, executor *job.Executor) (*Client, error) {
+	initialized := false
+	defer func() {
+		if !initialized && executor.Journal() != nil {
+			_ = executor.Journal().Close()
+		}
+	}()
+	if !types.ValidJobID(gpuID) {
+		return nil, fmt.Errorf("invalid GPU identifier")
+	}
 	c := &Client{
-		cfg:             cfg,
-		monitor:         monitor,
-		executor:        executor,
-		gpuID:           gpuID,
-		backend:         backend,
-		deviceIndex:     deviceIndex,
-		outbox:          make(chan interface{}, 64),
-		jobSlot:         make(chan struct{}, 1),
-		outboxDir:       filepath.Join(cfg.ModelCacheDir, "outbox", gpuID),
-		maintenanceGate: maintenanceGate,
+		cfg:              cfg,
+		monitor:          monitor,
+		executor:         executor,
+		gpuID:            gpuID,
+		backend:          backend,
+		deviceIndex:      deviceIndex,
+		outbox:           make(chan interface{}, 64),
+		resultsReady:     make(chan struct{}, 1),
+		jobSlot:          make(chan struct{}, 1),
+		outboxDir:        filepath.Join(cfg.ModelCacheDir, "outbox", gpuID),
+		maintenanceGate:  maintenanceGate,
+		executionJournal: executor.Journal(),
 	}
 	if err := os.MkdirAll(c.outboxDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create result outbox: %w", err)
 	}
 	c.loadPendingResults()
+	if c.executionJournal != nil {
+		for _, pending := range c.results {
+			if _, exists := c.executionJournal.Find(pending.result.JobID, pending.result.DispatchToken); !exists {
+				record, err := c.executionJournal.RememberLegacyResult(pending.result)
+				if err != nil {
+					return nil, err
+				}
+				if err := executor.TrackUnverifiedLegacy(record); err != nil {
+					return nil, err
+				}
+			}
+		}
+		for _, record := range c.executionJournal.Records() {
+			if record.CancelRequested {
+				if len(c.cancellationTombstones) >= maxCancellationTombstones {
+					c.cancellationAdmissionFenced = true
+				} else {
+					if c.cancellationTombstones == nil {
+						c.cancellationTombstones = make(map[string]*cancellationTombstone)
+					}
+					c.cancellationTombstones[attemptResultKey(record.JobID, record.DispatchToken)] = &cancellationTombstone{
+						knownUnstarted: record.KnownUnstarted, stopVerified: record.StopVerified,
+					}
+				}
+			}
+			if record.Result != nil {
 
-	// Relay job progress to the coordinator (best-effort — dropped if the outbox
-	// is full, so slow delivery never blocks inference).
+				for key, pending := range c.results {
+					if pending.result.JobID == record.JobID && pending.result.DispatchToken == record.DispatchToken {
+						if record.ResultAccepted {
+							if err := os.Remove(c.resultPath(key)); err != nil && !os.IsNotExist(err) {
+								return nil, fmt.Errorf("recover accepted result cleanup: %w", err)
+							}
+						}
+						delete(c.results, key)
+					}
+				}
+				if !record.ResultAccepted {
+					if pending := c.results[record.JobID]; pending != nil && pending.result.DispatchToken != record.DispatchToken {
+						c.queueAttemptRejection(*record.Result)
+					} else {
+						c.queueResult(*record.Result)
+					}
+				}
+			}
+		}
+		if err := c.executionJournal.Err(); err != nil {
+			return nil, err
+		}
+		if len(c.cancellationTombstones) >= maxCancellationTombstones {
+			c.cancellationAdmissionFenced = true
+		}
+	}
+
 	executor.OnProgress = func(p types.JobProgress) {
 		log("job %s: stage=%s progress=%.0f%%", shortJobRef(p.JobID), p.Stage, p.Progress*100)
 		c.enqueue(p)
 	}
 
+	initialized = true
 	return c, nil
 }
 
@@ -177,7 +274,6 @@ func deterministicGPUID(machineID string, deviceIndex int) string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// enqueue queues a message for delivery, dropping it if the outbox is full.
 func (c *Client) enqueue(msg interface{}) {
 	select {
 	case c.outbox <- msg:
@@ -185,9 +281,6 @@ func (c *Client) enqueue(msg interface{}) {
 	}
 }
 
-// RunCustomAssetCleanup removes expired machine-level custom assets only while
-// all GPU clients are idle. A single loop must be used for clients sharing a
-// cache directory.
 func RunCustomAssetCleanup(ctx context.Context, cfg *types.Config, clients []*Client) {
 	if cfg.CleanupIntervalHours <= 0 ||
 		(cfg.CustomAssetTTLDays < 0 && cfg.MaxCustomAssetCacheGB < 0) {
@@ -219,8 +312,15 @@ func RunCustomAssetCleanup(ctx context.Context, cfg *types.Config, clients []*Cl
 }
 
 func pruneCustomAssetsIfIdle(cfg *types.Config, clients []*Client, now time.Time) (files int, bytes int64, skipped bool, err error) {
+	for _, client := range clients {
+		if job.MachineRecoveryBlocked(client.maintenanceGate) {
+			return 0, 0, true, nil
+		}
+	}
 	if len(clients) > 0 && clients[0].maintenanceGate != nil {
-		clients[0].maintenanceGate.Lock()
+		if !clients[0].maintenanceGate.TryLock() {
+			return 0, 0, true, nil
+		}
 		defer clients[0].maintenanceGate.Unlock()
 	}
 	workspaceIDs := map[string]bool{}
@@ -250,15 +350,19 @@ func pruneCustomAssetsIfIdle(cfg *types.Config, clients []*Client, now time.Time
 	return files, bytes, false, err
 }
 
-// Run connects and serves until ctx is cancelled, reconnecting with backoff.
 func (c *Client) Run(ctx context.Context) error {
 	c.baseCtx = ctx
-	// On shutdown, tear down any containers/workspaces still running so we don't
-	// leave detached containers holding the GPU.
+
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		c.executor.StopAll(cleanupCtx)
+		if err := c.executor.StopAll(cleanupCtx); err != nil {
+			log("shutdown teardown could not be confirmed: %v", err)
+		} else if c.executionJournal != nil {
+			if err := c.executionJournal.Close(); err != nil {
+				log("close execution journal: %v", err)
+			}
+		}
 	}()
 
 	backoff := 2 * time.Second
@@ -337,7 +441,6 @@ func (c *Client) watchEarning(parent context.Context) (context.Context, context.
 	return ctx, cancel
 }
 
-// session runs one full connection lifecycle.
 func (c *Client) session(parent context.Context) error {
 	endpoint, err := c.endpoint()
 	if err != nil {
@@ -351,46 +454,104 @@ func (c *Client) session(parent context.Context) error {
 		return err
 	}
 	defer conn.Close()
-
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
+	stopClose := context.AfterFunc(parent, func() { _ = conn.Close() })
+	defer stopClose()
 
 	log("connected to pool as %s", c.gpuID)
 
-	// Session-scoped channel for register/heartbeat (these belong to this
-	// connection). Job results/progress go through the persistent c.outbox.
+	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := conn.WriteJSON(c.registerMessage()); err != nil {
+		return err
+	}
+	return c.serveConnection(parent, conn, registrationWait)
+}
+
+func (c *Client) serveConnection(parent context.Context, conn *websocket.Conn, registrationTimeout time.Duration) error {
+	ctx, cancel := context.WithCancel(parent)
+	writerDone := make(chan struct{})
+	defer func() {
+		cancel()
+		_ = conn.Close()
+		<-writerDone
+	}()
+
 	sendCh := make(chan interface{}, 16)
-	go c.writer(ctx, conn, sendCh)
+	registered := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		c.writer(ctx, conn, sendCh, registered)
+	}()
 
-	// Register immediately.
-	c.trySend(ctx, sendCh, c.registerMessage())
-
-	// Heartbeat loop.
 	go c.heartbeatLoop(ctx, sendCh)
 
-	// Read loop (blocks until disconnect/error). A read deadline plus pong
-	// handler detects a dead peer even when no application frames arrive.
-	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	registrationDeadline := time.Now().Add(registrationTimeout)
+	ready := false
+	refreshDeadline := func() error {
+		deadline := time.Now().Add(pongWait)
+		if !ready && registrationDeadline.Before(deadline) {
+			deadline = registrationDeadline
+		}
+		return conn.SetReadDeadline(deadline)
+	}
+	_ = refreshDeadline()
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(pongWait))
+		return refreshDeadline()
 	})
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			cancel()
+			if parent.Err() != nil {
+				return parent.Err()
+			}
+			if timeout, ok := err.(net.Error); !ready && ok && timeout.Timeout() {
+				return fmt.Errorf("registration acknowledgement timeout: %w", err)
+			}
 			return err
 		}
-		// Any inbound frame proves liveness — extend the deadline.
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		if !ready {
+			if err := parent.Err(); err != nil {
+				return err
+			}
+			if !time.Now().Before(registrationDeadline) {
+				return fmt.Errorf("registration acknowledgement timeout")
+			}
+			var ack struct {
+				Type    string `json:"type"`
+				Success bool   `json:"success"`
+				Error   string `json:"error"`
+			}
+			if json.Unmarshal(data, &ack) != nil || ack.Type != "gpu_register_ack" {
+				continue
+			}
+			if !ack.Success {
+				return fmt.Errorf("registration rejected: %s", ack.Error)
+			}
+			ready = true
+			close(registered)
+		}
+
+		_ = refreshDeadline()
 		c.dispatch(ctx, sendCh, data)
 	}
 }
 
-func (c *Client) writer(ctx context.Context, conn *websocket.Conn, sendCh <-chan interface{}) {
+func (c *Client) writer(ctx context.Context, conn *websocket.Conn, sendCh <-chan interface{}, registered <-chan struct{}) {
+
+	defer conn.Close()
 	ping := time.NewTicker(pingPeriod)
 	defer ping.Stop()
+	retry := time.NewTicker(resultRetryTick)
+	defer retry.Stop()
+
+	var outbox <-chan interface{}
+	var resultsReady <-chan struct{}
+	var retryResults <-chan time.Time
 
 	write := func(msg interface{}) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 		if err := conn.WriteJSON(msg); err != nil {
 			log("write error: %v", err)
@@ -403,15 +564,30 @@ func (c *Client) writer(ctx context.Context, conn *websocket.Conn, sendCh <-chan
 		select {
 		case <-ctx.Done():
 			return
+		case <-registered:
+			registered = nil
+			outbox = c.outbox
+			resultsReady = c.resultsReady
+			retryResults = retry.C
+			c.loadPendingResults()
+			if !c.sendPendingResults(ctx, time.Now(), write) {
+				return
+			}
 		case msg := <-sendCh:
 			if !write(msg) {
 				return
 			}
-		case msg := <-c.outbox:
+		case msg := <-outbox:
 			if !write(msg) {
-				// Delivery failed (disconnect). Requeue so the next session
-				// delivers the result rather than losing it, then exit.
 				c.enqueue(msg)
+				return
+			}
+		case <-resultsReady:
+			if !c.sendPendingResults(ctx, time.Now(), write) {
+				return
+			}
+		case now := <-retryResults:
+			if !c.sendPendingResults(ctx, now, write) {
 				return
 			}
 		case <-ping.C:
@@ -441,7 +617,6 @@ func (c *Client) heartbeatLoop(ctx context.Context, sendCh chan<- interface{}) {
 	}
 }
 
-// dispatch routes an inbound message.
 func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data []byte) {
 	var env types.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -451,42 +626,136 @@ func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data [
 	switch env.Type {
 	case "job_assignment":
 		var a types.JobAssignment
-		if err := json.Unmarshal(data, &a); err != nil {
-			log("bad job_assignment: %v", err)
+		decodeErr := json.Unmarshal(data, &a)
+
+		if !types.ValidJobID(a.JobID) {
+			log("rejected job_assignment: invalid job_id")
+			return
+		}
+		c.assignmentsMu.Lock()
+		defer c.assignmentsMu.Unlock()
+
+		if c.executionJournal != nil {
+			if record, exists := c.executionJournal.Find(a.JobID, a.DispatchToken); exists && record.Result != nil {
+				return
+			}
+		}
+		attemptKey := attemptResultKey(a.JobID, a.DispatchToken)
+		for _, settled := range c.settledAttempts {
+			if a.DispatchToken != "" && settled == attemptKey {
+				return
+			}
+		}
+		c.resultsMu.Lock()
+		pending := c.results[a.JobID]
+		rejected := a.DispatchToken != "" && c.results[attemptKey] != nil
+		c.resultsMu.Unlock()
+		if rejected {
+			return
+		}
+		if c.cancellationTombstones[attemptKey] != nil {
+			if (pending != nil && pending.result.DispatchToken == a.DispatchToken) ||
+				c.tracksAttempt(a.JobID, a.DispatchToken) {
+				return
+			}
+			c.rejectDeferredAssignment(a, fmt.Errorf("dispatch attempt was cancelled before admission"))
+			return
+		}
+		if c.cancellationAdmissionFenced {
+			if c.tracksAttempt(a.JobID, a.DispatchToken) {
+				return
+			}
+			if a.DispatchToken != "" {
+				if pending == nil || pending.result.DispatchToken != a.DispatchToken {
+					c.rejectDeferredAssignment(a, fmt.Errorf("agent admission is fenced: cancellation tombstone capacity reached"))
+				}
+			} else if pending == nil && c.activeAssignment != a.JobID && (c.executor == nil || !c.executor.IsTracked(a.JobID)) {
+				c.queueResult(types.JobResult{Type: "job_result", JobID: a.JobID, GPUID: c.gpuID,
+					Error: "agent admission is fenced: cancellation tombstone capacity reached"})
+			}
+			return
+		}
+		if deferred, exists := c.deferredAssignments[a.JobID]; exists {
+			if a.DispatchToken == "" || a.DispatchToken == deferred.DispatchToken ||
+				(pending != nil && a.DispatchToken == pending.result.DispatchToken) {
+				return
+			}
+			c.rejectDeferredAssignment(a, fmt.Errorf("GPU already has a deferred retry for this job"))
+			return
+		}
+		if pending != nil {
+			if a.DispatchToken == "" || pending.result.DispatchToken == "" || a.DispatchToken == pending.result.DispatchToken {
+				return
+			}
+			if c.assignmentCancelling(a) {
+				c.rejectDeferredAssignment(a, fmt.Errorf("job cancellation is in progress"))
+			} else if decodeErr != nil {
+				c.rejectDeferredAssignment(a, fmt.Errorf("invalid job_assignment: %w", decodeErr))
+			} else if err := a.Validate(); err != nil {
+				c.rejectDeferredAssignment(a, err)
+			} else if len(c.deferredAssignments) >= maxDeferredAssignments {
+				c.rejectDeferredAssignment(a, fmt.Errorf("deferred assignment queue is full"))
+			} else {
+				if c.executionJournal != nil {
+					if _, err := c.executionJournal.Admit(a, c.backend); err != nil {
+						c.rejectDeferredAssignment(a, err)
+						return
+					}
+				}
+				if c.deferredAssignments == nil {
+					c.deferredAssignments = make(map[string]types.JobAssignment)
+				}
+				c.deferredAssignments[a.JobID] = a
+			}
+			return
+		}
+		if c.activeAssignment == a.JobID || (c.executor != nil && c.executor.IsTracked(a.JobID)) {
+			return
+		}
+		reject := func(err error) {
+			log("rejected job_assignment: %v", err)
+			c.queueResult(types.JobResult{Type: "job_result", JobID: a.JobID, DispatchToken: a.DispatchToken, GPUID: c.gpuID, Error: err.Error()})
+		}
+		if decodeErr != nil {
+			reject(fmt.Errorf("invalid job_assignment: %w", decodeErr))
 			return
 		}
 		if err := a.Validate(); err != nil {
-			log("rejected job_assignment: %v", err)
+			reject(err)
 			return
 		}
-		hasMaintenanceLease := c.maintenanceGate != nil && c.maintenanceGate.TryRLock()
-		if c.maintenanceGate != nil && !hasMaintenanceLease {
-			c.enqueue(types.JobResult{Type: "job_result", JobID: a.JobID, GPUID: c.gpuID, Error: "GPU is in maintenance"})
+		if c.assignmentCancelling(a) {
+			reject(fmt.Errorf("job cancellation is in progress"))
 			return
 		}
-		select {
-		case c.jobSlot <- struct{}{}:
-			go c.runJob(a, hasMaintenanceLease)
-		default:
-			if hasMaintenanceLease {
-				c.maintenanceGate.RUnlock()
-			}
-			c.enqueue(types.JobResult{Type: "job_result", JobID: a.JobID, GPUID: c.gpuID, Error: "GPU is already running a job"})
-		}
+		c.startAssignmentLocked(a, false)
 	case "job_cancel", "job_stop", "stop_job":
 		var jc types.JobControl
-		if err := json.Unmarshal(data, &jc); err != nil || jc.JobID == "" {
+		if err := json.Unmarshal(data, &jc); err != nil || !types.ValidJobID(jc.JobID) {
 			return
 		}
-		log("cancelling job %s", jc.JobID)
-		go c.executor.Cancel(jc.JobID)
+		c.cancelJob(jc)
 	case "job_result_ack":
 		var ack struct {
-			JobID   string `json:"job_id"`
-			Success bool   `json:"success"`
+			JobID         string `json:"job_id"`
+			DispatchToken string `json:"dispatch_token"`
+			Success       bool   `json:"success"`
 		}
-		if json.Unmarshal(data, &ack) == nil && ack.JobID != "" && ack.Success {
-			_ = os.Remove(c.resultPath(ack.JobID))
+		if json.Unmarshal(data, &ack) == nil && types.ValidJobID(ack.JobID) && ack.Success {
+			c.assignmentsMu.Lock()
+			defer c.assignmentsMu.Unlock()
+			if accepted, canonical, token := c.ackResult(ack.JobID, ack.DispatchToken); accepted {
+				if token != "" {
+					if len(c.settledAttempts) == maxDeferredAssignments {
+						c.settledAttempts = c.settledAttempts[1:]
+					}
+					c.settledAttempts = append(c.settledAttempts, attemptResultKey(ack.JobID, token))
+				}
+				if canonical && c.executor != nil {
+					c.executor.ForgetExecution(ack.JobID)
+				}
+				c.drainDeferredAssignmentsLocked()
+			}
 		}
 	case "asset_cleanup":
 		var request types.AssetCleanupRequest
@@ -513,11 +782,18 @@ func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data [
 			} else if request.Phase == "execute" {
 				cleanupCtx, cancel := context.WithTimeout(c.baseCtx, 30*time.Minute)
 				defer cancel()
-				if c.maintenanceGate != nil {
-					c.maintenanceGate.Lock()
-					defer c.maintenanceGate.Unlock()
+				if job.MachineRecoveryBlocked(c.maintenanceGate) {
+					err = fmt.Errorf("cleanup blocked by unresolved execution recovery")
+				} else if c.maintenanceGate != nil {
+					if c.maintenanceGate.TryLock() {
+						defer c.maintenanceGate.Unlock()
+					} else {
+						err = fmt.Errorf("cleanup blocked while machine jobs are active or their stop is unverified")
+					}
 				}
-				preview, err = c.executor.ExecuteCleanup(cleanupCtx, request.Categories)
+				if err == nil {
+					preview, err = c.executor.ExecuteCleanup(cleanupCtx, request.Categories)
+				}
 			} else {
 				err = fmt.Errorf("unsupported cleanup phase")
 			}
@@ -538,17 +814,191 @@ func (c *Client) dispatch(ctx context.Context, sendCh chan<- interface{}, data [
 			}
 		}()
 	case "gpu_register_ack", "gpu_heartbeat_ack", "pool_metrics":
-		// informational; ignore
+
 	default:
-		// unknown; ignore
+
 	}
 }
 
-func (c *Client) runJob(a types.JobAssignment, hasMaintenanceLease bool) {
-	if hasMaintenanceLease {
-		defer c.maintenanceGate.RUnlock()
+func (c *Client) tracksAttempt(jobID, token string) bool {
+	if c.activeAssignment == jobID && c.activeDispatchToken == token {
+		return true
 	}
-	defer func() { <-c.jobSlot }()
+	if c.executor == nil {
+		return false
+	}
+	trackedToken, tracked := c.executor.TrackedDispatchToken(jobID)
+	return tracked && trackedToken == token
+}
+
+func (c *Client) assignmentCancelling(a types.JobAssignment) bool {
+	if _, pending := c.cancelling.Load(a.JobID); pending {
+		return true
+	}
+	_, pending := c.cancelling.Load(attemptResultKey(a.JobID, a.DispatchToken))
+	return a.DispatchToken != "" && pending
+}
+
+func (c *Client) cancellationTombstoneLocked(jobID, token string) (*cancellationTombstone, error) {
+	key := attemptResultKey(jobID, token)
+	if tombstone := c.cancellationTombstones[key]; tombstone != nil {
+		if c.executionJournal != nil {
+			record, err := c.executionJournal.RememberCancellation(jobID, token, false)
+			if err != nil {
+				c.cancellationAdmissionFenced = true
+				return nil, err
+			}
+			tombstone.knownUnstarted, tombstone.stopVerified = record.KnownUnstarted, record.StopVerified
+		}
+		return tombstone, nil
+	}
+	if len(c.cancellationTombstones) >= maxCancellationTombstones {
+		c.cancellationAdmissionFenced = true
+		return nil, fmt.Errorf("cancellation tombstone capacity reached; agent admission is fenced")
+	}
+	if c.cancellationTombstones == nil {
+		c.cancellationTombstones = make(map[string]*cancellationTombstone)
+	}
+	tombstone := &cancellationTombstone{}
+	if c.executionJournal != nil {
+		record, err := c.executionJournal.RememberCancellation(jobID, token, false)
+		if err != nil {
+			c.cancellationAdmissionFenced = true
+			return nil, err
+		}
+		tombstone.knownUnstarted, tombstone.stopVerified = record.KnownUnstarted, record.StopVerified
+	}
+	c.cancellationTombstones[key] = tombstone
+	return tombstone, nil
+}
+
+func (c *Client) cancelJob(control types.JobControl) {
+	c.assignmentsMu.Lock()
+	key := control.JobID
+	var tombstone *cancellationTombstone
+	if control.DispatchToken != "" {
+		var err error
+		tombstone, err = c.cancellationTombstoneLocked(control.JobID, control.DispatchToken)
+		if err != nil {
+			c.enqueue(types.JobCancelAck{Type: "job_cancel_ack", JobID: control.JobID,
+				DispatchToken: control.DispatchToken, Error: err.Error()})
+			c.assignmentsMu.Unlock()
+			return
+		}
+		key = attemptResultKey(control.JobID, control.DispatchToken)
+	}
+	if _, pending := c.cancelling.LoadOrStore(key, struct{}{}); pending {
+		c.assignmentsMu.Unlock()
+		return
+	}
+	deferred, wasDeferred := c.deferredAssignments[control.JobID]
+	wasDeferred = wasDeferred && (control.DispatchToken == "" || control.DispatchToken == deferred.DispatchToken)
+	if wasDeferred {
+		delete(c.deferredAssignments, control.JobID)
+		if tombstone == nil && deferred.DispatchToken != "" {
+			tombstone, _ = c.cancellationTombstoneLocked(control.JobID, deferred.DispatchToken)
+		}
+		if tombstone != nil {
+			tombstone.knownUnstarted = true
+		}
+		c.rejectDeferredAssignment(deferred, fmt.Errorf("job cancelled before deferred execution"))
+	}
+	matchingAttempt := control.DispatchToken != "" && c.tracksAttempt(control.JobID, control.DispatchToken)
+	legacyDeferredOnly := control.DispatchToken == "" && wasDeferred && c.activeAssignment != control.JobID &&
+		(c.executor == nil || !c.executor.IsTracked(control.JobID))
+	if control.DispatchToken != "" && !matchingAttempt && !tombstone.knownUnstarted && !tombstone.stopVerified {
+		c.cancelling.Delete(key)
+		c.enqueue(types.JobCancelAck{Type: "job_cancel_ack", JobID: control.JobID, DispatchToken: control.DispatchToken,
+			Error: "dispatch attempt is not tracked; execution stop cannot be confirmed"})
+		c.assignmentsMu.Unlock()
+		return
+	}
+	c.assignmentsMu.Unlock()
+	go func() {
+		var err error
+		switch {
+		case matchingAttempt:
+			err = c.executor.CancelAttempt(control.JobID, control.DispatchToken)
+		case control.DispatchToken == "" && !legacyDeferredOnly:
+			err = c.executor.Cancel(control.JobID)
+		}
+		c.assignmentsMu.Lock()
+		if matchingAttempt && err == nil {
+			tombstone.stopVerified = true
+		}
+		c.cancelling.Delete(key)
+		c.resultsMu.Lock()
+		pending := c.results[control.JobID] != nil
+		c.resultsMu.Unlock()
+		if err == nil && !pending && c.executor != nil &&
+			(control.DispatchToken == "" || (matchingAttempt && c.tracksAttempt(control.JobID, control.DispatchToken))) {
+			c.executor.ForgetExecution(control.JobID)
+		}
+		c.drainDeferredAssignmentsLocked()
+		c.assignmentsMu.Unlock()
+		ack := types.JobCancelAck{Type: "job_cancel_ack", JobID: control.JobID,
+			DispatchToken: control.DispatchToken, Success: err == nil}
+		if err != nil {
+			ack.Error = err.Error()
+		}
+		c.enqueue(ack)
+	}()
+}
+
+func (c *Client) rejectDeferredAssignment(a types.JobAssignment, err error) {
+	c.queueAttemptRejection(types.JobResult{
+		Type: "job_result", JobID: a.JobID, DispatchToken: a.DispatchToken,
+		GPUID: c.gpuID, Error: err.Error(),
+	})
+}
+
+func (c *Client) startAssignmentLocked(a types.JobAssignment, deferred bool) {
+	if c.cancellationAdmissionFenced || (a.DispatchToken != "" &&
+		c.cancellationTombstones[attemptResultKey(a.JobID, a.DispatchToken)] != nil) {
+		result := types.JobResult{Type: "job_result", JobID: a.JobID, DispatchToken: a.DispatchToken,
+			GPUID: c.gpuID, Error: "dispatch attempt cannot start: cancellation admission fence"}
+		c.queueResult(result)
+		return
+	}
+	select {
+	case c.jobSlot <- struct{}{}:
+		results, err := c.executor.Start(c.baseCtx, a)
+		if err != nil {
+			<-c.jobSlot
+			log("could not start job %s: %v", shortJobRef(a.JobID), err)
+			if deferred || !errors.Is(err, job.ErrAlreadyTracked) {
+				c.queueResult(types.JobResult{Type: "job_result", JobID: a.JobID, DispatchToken: a.DispatchToken, GPUID: c.gpuID, Error: err.Error()})
+			}
+			return
+		}
+		c.activeAssignment = a.JobID
+		c.activeDispatchToken = a.DispatchToken
+		go c.runJob(a, results)
+	default:
+		c.queueResult(types.JobResult{Type: "job_result", JobID: a.JobID, DispatchToken: a.DispatchToken, GPUID: c.gpuID, Error: "GPU is already running a job"})
+	}
+}
+
+func (c *Client) drainDeferredAssignmentsLocked() {
+	if c.activeAssignment != "" || len(c.jobSlot) != 0 || c.jobSlot == nil {
+		return
+	}
+	for id, a := range c.deferredAssignments {
+		c.resultsMu.Lock()
+		pending := c.results[id] != nil
+		c.resultsMu.Unlock()
+		if pending || c.assignmentCancelling(a) {
+			continue
+		}
+		delete(c.deferredAssignments, id)
+		c.startAssignmentLocked(a, true)
+		if c.activeAssignment != "" {
+			return
+		}
+	}
+}
+
+func (c *Client) runJob(a types.JobAssignment, results <-chan types.JobResult) {
 	atomic.AddInt64(&c.activeJobs, 1)
 	defer atomic.AddInt64(&c.activeJobs, -1)
 
@@ -558,64 +1008,22 @@ func (c *Client) runJob(a types.JobAssignment, hasMaintenanceLease bool) {
 		source = "RunGPU customer"
 	}
 	log("received job %s from %s: model=%q runtime=%s custom_assets=%d workspace=%t", jobRef, source, a.ModelName, c.executor.Runtime(), len(a.CustomFiles), a.Workspace)
-	// Run under the process-lifetime context so a reconnect doesn't abort the
-	// job. Cancellation still happens via the executor (job_cancel / shutdown).
-	result := c.executor.Execute(c.baseCtx, a)
+
+	result := <-results
+	result.DispatchToken = a.DispatchToken
 	if result.Success {
 		log("job %s completed in %dms", jobRef, result.DurationMS)
 	} else {
 		log("job %s failed after %dms", jobRef, result.DurationMS)
 	}
-	// Deliver via the persistent outbox (blocking, so the result is never
-	// dropped — it waits for a live session if we're momentarily disconnected).
-	if err := c.persistResult(result); err != nil {
-		log("could not persist result for job %s: %v", a.JobID, err)
-	}
-	select {
-	case <-c.baseCtx.Done():
-	case c.outbox <- result:
-	}
+	c.assignmentsMu.Lock()
+	defer c.assignmentsMu.Unlock()
+	c.queueResult(result)
+	c.activeAssignment = ""
+	c.activeDispatchToken = ""
+	<-c.jobSlot
+	c.drainDeferredAssignmentsLocked()
 }
-
-func (c *Client) resultPath(jobID string) string {
-	return filepath.Join(c.outboxDir, filepath.Base(jobID)+".json")
-}
-
-func (c *Client) persistResult(result types.JobResult) error {
-	data, err := json.Marshal(result)
-	if err != nil {
-		return err
-	}
-	path := c.resultPath(result.JobID)
-	temporary := path + ".tmp"
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(temporary, path)
-}
-
-func (c *Client) loadPendingResults() {
-	entries, err := os.ReadDir(c.outboxDir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		data, readErr := os.ReadFile(filepath.Join(c.outboxDir, entry.Name()))
-		if readErr != nil {
-			continue
-		}
-		var result types.JobResult
-		if json.Unmarshal(data, &result) != nil || result.JobID == "" {
-			continue
-		}
-		c.enqueue(result)
-	}
-}
-
-// ── Message builders ──────────────────────────────────────────────────────────
 
 func (c *Client) registerMessage() types.RegisterMessage {
 	gpus := c.monitor.GPUs()
@@ -656,13 +1064,20 @@ func (c *Client) heartbeatMessage() types.HeartbeatMessage {
 		if m.MemoryTotalMB > 0 {
 			availGB = float64(m.MemoryTotalMB-m.MemoryUsedMB) / 1024.0
 		}
-		break // primary GPU
+		break
+	}
+	currentJobs := int(atomic.LoadInt64(&c.activeJobs))
+	if executor, ok := c.executor.(*job.Executor); ok {
+		currentJobs = max(currentJobs, executor.ReservedJobs())
+	}
+	if job.MachineRecoveryBlocked(c.maintenanceGate) {
+		availGB = 0
 	}
 	return types.HeartbeatMessage{
 		Type:            "gpu_heartbeat",
 		GPUID:           c.gpuID,
 		AvailableVRAMGB: availGB,
-		CurrentJobs:     int(atomic.LoadInt64(&c.activeJobs)),
+		CurrentJobs:     currentJobs,
 		ModelsCached:    c.cachedModels(),
 		OllamaModels:    gpu.OllamaModels(),
 	}
@@ -682,9 +1097,6 @@ func (c *Client) cachedModels() []string {
 	return models
 }
 
-// endpoint converts the configured pool URL into a ws(s):// agent endpoint
-// with a non-secret GPU identity query parameter. Authentication is sent in
-// the Authorization header during the WebSocket upgrade.
 func (c *Client) endpoint() (string, error) {
 	u, err := url.Parse(c.cfg.PoolURL)
 	if err != nil {
@@ -710,7 +1122,6 @@ func (c *Client) endpoint() (string, error) {
 	return u.String(), nil
 }
 
-// trySend pushes a message unless the context is done.
 func (c *Client) trySend(ctx context.Context, sendCh chan<- interface{}, msg interface{}) {
 	select {
 	case <-ctx.Done():

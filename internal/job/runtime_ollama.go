@@ -16,7 +16,6 @@ import (
 )
 
 const defaultOllamaEndpoint = "http://localhost:11434"
-const managedWarmTTL = "3m"
 
 type ollamaRuntime struct {
 	cacheDir string
@@ -47,7 +46,6 @@ func newOllamaRuntime(cacheDir, hostBackend string) *ollamaRuntime {
 
 func (r *ollamaRuntime) Name() string { return "ollama" }
 
-// ollamaModel resolves the Ollama tag for a job.
 func ollamaModel(a types.JobAssignment) string {
 	if a.Parameters != nil {
 		if v, ok := a.Parameters["ollama_model"].(string); ok && v != "" {
@@ -57,7 +55,6 @@ func ollamaModel(a types.JobAssignment) string {
 	return a.ModelName
 }
 
-// extractPrompt pulls a text prompt out of the job input.
 func extractPrompt(a types.JobAssignment) string {
 	if a.Input != nil {
 		if p, ok := a.Input["prompt"].(string); ok && p != "" {
@@ -76,7 +73,6 @@ func extractPrompt(a types.JobAssignment) string {
 	return string(b)
 }
 
-// isServerRunning checks if the Ollama HTTP server is responding.
 func (r *ollamaRuntime) isServerRunning() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -89,34 +85,22 @@ func (r *ollamaRuntime) isServerRunning() bool {
 		return false
 	}
 	resp.Body.Close()
-	// Ollama returns 200 on GET / with "Ollama is running"
+
 	return resp.StatusCode == http.StatusOK
 }
 
-// ensureServerRunning checks if the Ollama server is up. If not, it starts
-// `ollama serve` in the background and waits for it to become ready.
-// This handles the common case where ollama is installed but the user hasn't
-// started the server (especially on macOS where it's not auto-started).
-//
-// Only auto-starts when using the default endpoint (localhost:11434).
-// Custom endpoints (e.g. in tests) are assumed to be managed externally.
 func (r *ollamaRuntime) ensureServerRunning(ctx context.Context) error {
-	// Already running? Great.
+
 	if r.isServerRunning() {
 		return nil
 	}
 
-	// Only auto-start for the default local endpoint.
-	// Custom endpoints (tests, remote servers) are managed externally.
 	if r.endpoint != defaultOllamaEndpoint {
 		return fmt.Errorf("ollama server not responding at %s", r.endpoint)
 	}
 
 	fmt.Println("[ollama] Server not running — starting it automatically...")
 
-	// Start `ollama serve` in the background.
-	// On macOS, the Ollama app may also work — but `ollama serve` is the
-	// CLI way that works everywhere.
 	cmd := exec.Command("ollama", "serve")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -127,12 +111,10 @@ func (r *ollamaRuntime) ensureServerRunning(ctx context.Context) error {
 			"  Start it manually with: ollama serve", err)
 	}
 
-	// Don't wait for the process — let it run in the background.
 	go func() {
 		cmd.Wait()
 	}()
 
-	// Wait for the server to become ready (up to 30 seconds).
 	fmt.Println("[ollama] Waiting for server to be ready...")
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -151,8 +133,6 @@ func (r *ollamaRuntime) ensureServerRunning(ctx context.Context) error {
 	}
 }
 
-// isModelCached checks if the model is already downloaded by querying the
-// Ollama /api/show endpoint. Returns true if the model exists locally.
 func (r *ollamaRuntime) isModelCached(ctx context.Context, model string) bool {
 	body, _ := json.Marshal(map[string]string{"name": model})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint+"/api/show", bytes.NewReader(body))
@@ -168,8 +148,6 @@ func (r *ollamaRuntime) isModelCached(ctx context.Context, model string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// installOllama preserves the existing setup probe for diagnostics and tests.
-// Installation is intentionally restricted to the explicit setup command.
 func installOllama(ctx context.Context) error {
 	_ = ctx
 	if _, err := exec.LookPath("ollama"); err == nil {
@@ -178,27 +156,21 @@ func installOllama(ctx context.Context) error {
 	return fmt.Errorf("ollama is not installed; run rungpu-agent setup")
 }
 
-// Prepare ensures the model is available locally, starts the server if needed,
-// checks the cache, and pulls the model if not present.
 func (r *ollamaRuntime) Prepare(ctx context.Context, a types.JobAssignment) error {
 	model := ollamaModel(a)
 
-	// 1. Check if ollama binary exists.
 	if _, err := exec.LookPath("ollama"); err != nil {
 		return fmt.Errorf("ollama is not installed; run rungpu-agent setup")
 	}
 
-	// 2. Ensure the Ollama server is running (auto-start if needed)
 	if err := r.ensureServerRunning(ctx); err != nil {
 		return err
 	}
 
-	// 3. Check if model is already cached via Ollama API (fast, no download)
 	if r.isModelCached(ctx, model) {
-		return nil // already downloaded — skip pull
+		return nil
 	}
 
-	// 4. Model not cached — pull it (downloads from Ollama registry)
 	fmt.Printf("[ollama] Pulling model %s (this may take a few minutes on first run)...\n", model)
 	cmd := exec.CommandContext(ctx, "ollama", "pull", model)
 	cmd.Stdout = os.Stdout
@@ -212,9 +184,8 @@ func (r *ollamaRuntime) Prepare(ctx context.Context, a types.JobAssignment) erro
 	return nil
 }
 
-// Run sends a generate request to the local Ollama server.
 func (r *ollamaRuntime) Run(ctx context.Context, a types.JobAssignment) (map[string]interface{}, error) {
-	// Ensure server is still running (it may have been stopped between Prepare and Run)
+
 	if err := r.ensureServerRunning(ctx); err != nil {
 		return nil, err
 	}
@@ -226,7 +197,7 @@ func (r *ollamaRuntime) Run(ctx context.Context, a types.JobAssignment) (map[str
 		"model":      model,
 		"prompt":     prompt,
 		"stream":     false,
-		"keep_alive": managedWarmTTL,
+		"keep_alive": 0,
 		"options":    a.Parameters,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint+"/api/generate", bytes.NewReader(reqBody))
@@ -249,9 +220,13 @@ func (r *ollamaRuntime) Run(ctx context.Context, a types.JobAssignment) (map[str
 		Response  string `json:"response"`
 		Model     string `json:"model"`
 		EvalCount int    `json:"eval_count"`
+		Done      bool   `json:"done"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&gen); err != nil {
 		return nil, err
+	}
+	if !gen.Done {
+		return nil, fmt.Errorf("ollama response did not confirm generation completed")
 	}
 	return map[string]interface{}{
 		"status":     "completed",

@@ -44,7 +44,7 @@ func TestRuntimeSmoke_NativeOllamaInference(t *testing.T) {
 		},
 		Parameters: map[string]interface{}{
 			"temperature": 0.0,
-			"num_predict":  8,
+			"num_predict": 8,
 		},
 	})
 	if err != nil {

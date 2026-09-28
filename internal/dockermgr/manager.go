@@ -1,6 +1,3 @@
-// Package dockermgr drives container lifecycle via the local `docker` CLI.
-// Every container is sandboxed: no-new-privileges, pids-limit, mount validation,
-// and image allowlist enforcement.
 package dockermgr
 
 import (
@@ -19,35 +16,37 @@ func New() *Manager {
 	return &Manager{Policy: DefaultPolicy()}
 }
 
-// NewWithPolicy creates a manager with a custom security policy.
 func NewWithPolicy(policy SecurityPolicy) *Manager {
 	return &Manager{Policy: policy}
 }
 
-// RunOptions configures a detached container run.
 type RunOptions struct {
-	Image      string
-	Name       string
-	Env        map[string]string
-	Mounts     []string // "hostPath:containerPath[:ro]" (bind mounts)
-	Volumes    []string // "namedVolume:containerPath" (Docker named volumes — persistent)
-	Ports      []string // "hostPort:containerPort"
-	Network    string   // required: "none" for batch jobs or "bridge" for workspaces
-	UseGPU     bool
-	GPUDevice  string   // "" or "all" → all GPUs; else passed as --gpus device=<GPUDevice>
-	ShmSize    string   // shared memory size (e.g. "8g")
-	Entrypoint string   // trusted runtime entrypoint override
-	Command    []string // override CMD
-	// UseHostMemory removes the Docker memory cap for a trusted platform
-	// runtime. The Docker host/VM remains the hard limit. Never set this from
-	// renter-controlled input.
+	Image            string
+	Name             string
+	Env              map[string]string
+	Labels           map[string]string
+	ExpectedDaemonID string
+	Mounts           []string
+	Volumes          []string
+	Ports            []string
+	Network          string
+	UseGPU           bool
+	GPUDevice        string
+	ShmSize          string
+	Entrypoint       string
+	Command          []string
+
 	UseHostMemory bool
 }
 
-// Run starts a sandboxed detached container and returns its ID.
-// Enforces: image allowlist, mount validation, no-new-privileges, pids-limit.
 func (m *Manager) Run(ctx context.Context, opts RunOptions) (string, error) {
-	// ── Security checks ─────────────────────────────────────────────────
+	if opts.ExpectedDaemonID != "" {
+		id, err := m.DaemonID(ctx)
+		if err != nil || id != opts.ExpectedDaemonID {
+			return "", fmt.Errorf("Docker daemon changed before container creation")
+		}
+	}
+
 	if err := ValidateImage(opts.Image, WithAssignedImage(m.Policy, opts.Image)); err != nil {
 		return "", fmt.Errorf("security: %w", err)
 	}
@@ -58,7 +57,6 @@ func (m *Manager) Run(ctx context.Context, opts RunOptions) (string, error) {
 		return "", fmt.Errorf("security: container network must be none or bridge")
 	}
 
-	// ── Build docker run command ────────────────────────────────────────
 	args := m.buildRunArgs(opts)
 
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
@@ -68,15 +66,9 @@ func (m *Manager) Run(ctx context.Context, opts RunOptions) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// buildRunArgs assembles the `docker run` arguments for opts, applying the
-// sandbox policy and GPU scoping. Pure (no side effects) so it can be tested.
 func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	args := []string{"run", "-d", "--name", opts.Name}
 
-	// Sandbox args (always applied — renter cannot override). Managed media
-	// decoding can temporarily need nearly all RAM exposed by Docker, so its
-	// trusted runtime may rely on the host/VM limit instead of a lower
-	// per-container cap.
 	policy := m.Policy
 	if opts.UseHostMemory {
 		policy.MaxMemoryGB = 0
@@ -85,8 +77,7 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	args = append(args, "--network", opts.Network)
 
 	if opts.UseGPU {
-		// Scope to a specific device when configured so a single job on a
-		// multi-GPU host can't grab every GPU; default to all otherwise.
+
 		if dev := strings.TrimSpace(opts.GPUDevice); dev != "" && strings.ToLower(dev) != "all" {
 			args = append(args, "--gpus", "device="+dev)
 		} else {
@@ -99,8 +90,7 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	for _, mnt := range opts.Mounts {
 		args = append(args, "-v", mnt)
 	}
-	// Named volumes — Docker manages these; they persist across container
-	// restarts and removals. Used for model caches, custom nodes, etc.
+
 	for _, vol := range opts.Volumes {
 		args = append(args, "-v", vol)
 	}
@@ -110,6 +100,9 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	for k, v := range opts.Env {
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
+	for k, v := range opts.Labels {
+		args = append(args, "--label", k+"="+v)
+	}
 	if opts.Entrypoint != "" {
 		args = append(args, "--entrypoint", opts.Entrypoint)
 	}
@@ -118,7 +111,6 @@ func (m *Manager) buildRunArgs(opts RunOptions) []string {
 	return args
 }
 
-// Exec runs a command inside a running container and returns combined output.
 func (m *Manager) Exec(ctx context.Context, name string, command []string) (string, error) {
 	if strings.TrimSpace(name) == "" || len(command) == 0 {
 		return "", fmt.Errorf("docker exec requires a container name and command")
@@ -131,7 +123,6 @@ func (m *Manager) Exec(ctx context.Context, name string, command []string) (stri
 	return string(out), nil
 }
 
-// Logs returns up to `tail` lines of a container's combined output.
 func (m *Manager) Logs(ctx context.Context, name string, tail int) (string, error) {
 	out, err := exec.CommandContext(ctx, "docker", "logs", "--tail", strconv.Itoa(tail), name).CombinedOutput()
 	if err != nil {
@@ -140,7 +131,6 @@ func (m *Manager) Logs(ctx context.Context, name string, tail int) (string, erro
 	return string(out), nil
 }
 
-// Inspect returns the container's running state and exit code.
 func (m *Manager) Inspect(ctx context.Context, name string) (running bool, exitCode int, err error) {
 	out, err := exec.CommandContext(ctx, "docker", "inspect",
 		"-f", "{{.State.Running}} {{.State.ExitCode}}", name).Output()
@@ -156,25 +146,49 @@ func (m *Manager) Inspect(ctx context.Context, name string) (running bool, exitC
 	return running, exitCode, nil
 }
 
-// Stop stops a container (best-effort).
 func (m *Manager) Stop(ctx context.Context, name string) error {
 	return exec.CommandContext(ctx, "docker", "stop", name).Run()
 }
 
-// Remove force-removes a container (best-effort).
 func (m *Manager) Remove(ctx context.Context, name string) error {
 	return exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
 }
 
-// Available reports whether the docker CLI is usable.
+func (m *Manager) RemoveAndVerify(ctx context.Context, name string) error {
+	exists := func() (bool, error) {
+		out, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--format", "{{.Names}}").Output()
+		if err != nil {
+			return false, fmt.Errorf("verify container %s: %w", name, err)
+		}
+
+		for _, entry := range strings.Fields(string(out)) {
+			if entry == name {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	present, err := exists()
+	if err != nil || !present {
+		return err
+	}
+	if err := m.Remove(ctx, name); err != nil {
+		return fmt.Errorf("remove container %s: %w", name, err)
+	}
+	present, err = exists()
+	if err != nil {
+		return err
+	}
+	if present {
+		return fmt.Errorf("container %s still exists after removal", name)
+	}
+	return nil
+}
+
 func (m *Manager) Available(ctx context.Context) bool {
 	return exec.CommandContext(ctx, "docker", "version").Run() == nil
 }
 
-// ── Cleanup helpers ─────────────────────────────────────────────────────────
-
-// ListTokenizeContainers returns all containers (running + stopped) whose name
-// starts with "tokenize-".
 func (m *Manager) ListTokenizeContainers(ctx context.Context) ([]ContainerInfo, error) {
 	out, err := exec.CommandContext(ctx, "docker", "ps", "-a",
 		"--filter", "name=tokenize-",
@@ -201,7 +215,6 @@ func (m *Manager) ListTokenizeContainers(ctx context.Context) ([]ContainerInfo, 
 	return containers, nil
 }
 
-// ContainerInfo holds basic info about a Docker container.
 type ContainerInfo struct {
 	ID     string
 	Name   string
@@ -209,7 +222,6 @@ type ContainerInfo struct {
 	Image  string
 }
 
-// RemoveAllTokenizeContainers stops and removes all tokenize-* containers.
 func (m *Manager) RemoveAllTokenizeContainers(ctx context.Context) (int, error) {
 	containers, err := m.ListTokenizeContainers(ctx)
 	if err != nil {
@@ -225,8 +237,6 @@ func (m *Manager) RemoveAllTokenizeContainers(ctx context.Context) (int, error) 
 	return removed, nil
 }
 
-// ListTokenizeVolumes returns all Docker named volumes whose name starts with
-// "tokenize-".
 func (m *Manager) ListTokenizeVolumes(ctx context.Context) ([]VolumeInfo, error) {
 	out, err := exec.CommandContext(ctx, "docker", "volume", "ls",
 		"--filter", "name=tokenize-",
@@ -249,19 +259,15 @@ func (m *Manager) ListTokenizeVolumes(ctx context.Context) ([]VolumeInfo, error)
 	return volumes, nil
 }
 
-// VolumeInfo holds basic info about a Docker volume.
 type VolumeInfo struct {
 	Name   string
 	Driver string
 }
 
-// RemoveVolume removes a single Docker named volume.
 func (m *Manager) RemoveVolume(ctx context.Context, name string) error {
 	return exec.CommandContext(ctx, "docker", "volume", "rm", name).Run()
 }
 
-// ListTokenizeImages returns images used by tokenize-* containers, not a
-// product catalog.
 func (m *Manager) ListTokenizeImages(ctx context.Context) ([]ImageInfo, error) {
 	used, err := exec.CommandContext(ctx, "docker", "ps", "-a",
 		"--filter", "name=tokenize-", "--format", "{{.Image}}").Output()
@@ -303,14 +309,12 @@ func (m *Manager) ListTokenizeImages(ctx context.Context) ([]ImageInfo, error) {
 	return images, nil
 }
 
-// ImageInfo holds basic info about a Docker image.
 type ImageInfo struct {
 	Repository string
 	ID         string
 	Size       string
 }
 
-// RemoveImage removes a Docker image by ID.
 func (m *Manager) RemoveImage(ctx context.Context, id string) error {
 	return exec.CommandContext(ctx, "docker", "rmi", "-f", id).Run()
 }

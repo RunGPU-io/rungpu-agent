@@ -21,29 +21,19 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
-// Deterministic container names so a job's container can be found and torn down
-// by job id alone (on cancel or shutdown), even from a different goroutine.
 func CustomContainerName(jobID string) string    { return "tokenize-custom-" + jobID }
 func WorkspaceContainerName(jobID string) string { return "tokenize-ws-" + jobID }
 
-// maxDownloadBytes caps the size of a single custom-file download (0 = unlimited).
-// Set from config via SetMaxDownloadBytes so a job can't fill the host disk.
 var maxDownloadBytes int64
 var customAssetCacheMu sync.RWMutex
 var customAssetDownloadLocks sync.Map
 
-// SetMaxDownloadBytes sets the per-file download cap in bytes (0 = unlimited).
 func SetMaxDownloadBytes(n int64) { atomic.StoreInt64(&maxDownloadBytes, n) }
 
-// configuredHFToken is the HuggingFace token from config, used as a fallback
-// when the HF_TOKEN env var is not set.
-var configuredHFToken atomic.Value // string
+var configuredHFToken atomic.Value
 
-// SetHFToken records the HuggingFace token from config.
 func SetHFToken(t string) { configuredHFToken.Store(t) }
 
-// hfToken returns the effective HuggingFace token: env var takes precedence,
-// then the configured token.
 func hfToken() string {
 	if t := os.Getenv("HF_TOKEN"); t != "" {
 		return t
@@ -54,8 +44,6 @@ func hfToken() string {
 	return ""
 }
 
-// ProgressFunc is called at each pipeline stage so the caller can relay
-// progress to the WebSocket (and thus to the user's browser).
 type ProgressFunc func(stage string, progress float64, message string)
 
 var cachedFileChtimes = os.Chtimes
@@ -79,14 +67,12 @@ func StageInlineWorkflow(workflow, expectedSHA256, stagingDir string) error {
 	return nil
 }
 
-// ResolveImage determines the explicit Docker batch worker to use for a job.
 func ResolveImage(a types.JobAssignment) (string, error) {
-	// 1. Explicit DockerImage field
+
 	if a.DockerImage != "" {
 		return a.DockerImage, nil
 	}
 
-	// 2. Parameters["docker_image"]
 	if a.Parameters != nil {
 		if img, ok := a.Parameters["docker_image"].(string); ok && img != "" {
 			return img, nil
@@ -100,23 +86,19 @@ var TrustedUploadHosts = []string{"storage.googleapis.com"}
 
 var allowInsecureLoopbackForTests bool
 
-// SafeFileExtensions are the only file types we allow downloading.
 var SafeFileExtensions = []string{
-	".safetensors",                    // model weights without executable pickle payloads
-	".json", ".yaml", ".yml", ".toml", // configs, workflows
-	".png", ".jpg", ".jpeg", ".webp", // reference images
-	".wav", ".mp3",                   // reference audio
-	".txt", ".csv", // prompts, metadata
+	".safetensors",
+	".json", ".yaml", ".yml", ".toml",
+	".png", ".jpg", ".jpeg", ".webp",
+	".wav", ".mp3",
+	".txt", ".csv",
 }
 
-// ValidateCustomFileURL checks that a download URL is from a trusted source
-// and the target path doesn't escape the staging directory.
 func ValidateCustomFileURL(url, path string) error {
 	if err := validateHTTPSURL(url); err != nil {
 		return fmt.Errorf("custom file URL %q is not allowed: %w", url, err)
 	}
 
-	// Check file extension
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == "" {
 		ext = strings.ToLower(filepath.Ext(url))
@@ -133,7 +115,6 @@ func ValidateCustomFileURL(url, path string) error {
 			ext, strings.Join(SafeFileExtensions, ", "))
 	}
 
-	// Prevent path traversal (e.g. "../../etc/passwd")
 	cleaned := filepath.Clean(path)
 	if filepath.IsAbs(path) || strings.HasPrefix(filepath.ToSlash(path), "/") ||
 		cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
@@ -175,25 +156,40 @@ func trustedDownloadClient() *http.Client {
 		if len(via) >= 10 {
 			return fmt.Errorf("too many redirects")
 		}
-		return validateHTTPSURL(req.URL.String())
+		if err := validateHTTPSURL(req.URL.String()); err != nil {
+			return err
+		}
+		if !isHuggingFaceHost(req.URL.Hostname()) {
+			req.Header.Del("Authorization")
+		}
+		return nil
 	}}
 }
 
-// DownloadCustomFiles downloads safe model assets and workflows into a staging
-// directory. Only downloads from trusted sources with safe file extensions.
+func isHuggingFaceHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	return host == "huggingface.co" || strings.HasSuffix(host, ".huggingface.co") ||
+		host == "hf.co" || strings.HasSuffix(host, ".hf.co")
+}
+
+func shouldAttachHuggingFaceToken(target *url.URL) bool {
+	if isHuggingFaceHost(target.Hostname()) {
+		return true
+	}
+	return allowInsecureLoopbackForTests &&
+		(target.Hostname() == "127.0.0.1" || target.Hostname() == "::1") &&
+		strings.Contains(target.Path, "/huggingface.co/")
+}
+
 func DownloadCustomFiles(ctx context.Context, files []types.CustomFile, stagingDir string, progress ProgressFunc) error {
 	return DownloadCustomFilesCached(ctx, files, stagingDir, "", progress)
 }
 
-// DownloadCustomFilesCached stores one immutable copy per digest in assetCacheDir
-// and stages links/copies for each job. An empty cache directory preserves the
-// legacy per-job behavior used by callers that do not own a persistent cache.
 func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, stagingDir, assetCacheDir string, progress ProgressFunc) error {
 	if len(files) == 0 {
 		return nil
 	}
 
-	// Validate ALL files before downloading any
 	for _, f := range files {
 		if err := ValidateCustomFileURL(f.URL, f.Path); err != nil {
 			return fmt.Errorf("security: %w", err)
@@ -247,7 +243,6 @@ func DownloadCustomFilesCached(ctx context.Context, files []types.CustomFile, st
 			return fmt.Errorf("create dir for %s: %w", f.Path, err)
 		}
 
-		// Skip if this job already has the exact staged content.
 		if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
 			if verifyFileSHA256(destPath, f.SHA256) == nil {
 				continue
@@ -343,9 +338,6 @@ func verifyFileSHA256(path, expected string) error {
 	return nil
 }
 
-// PruneCustomAssets removes expired files, then evicts least-recently-used
-// files until the cache is within maxBytes. Modification time is refreshed on
-// every cache hit, so the policy survives process restarts without an index.
 func PruneCustomAssets(cacheDir string, ttl time.Duration, maxBytes int64, now time.Time) (files int, bytes int64, err error) {
 	if ttl <= 0 && maxBytes <= 0 {
 		return 0, 0, nil
@@ -396,8 +388,6 @@ func PruneCustomAssets(cacheDir string, ttl time.Duration, maxBytes int64, now t
 	return files, bytes, nil
 }
 
-// PruneBatchStaging removes completed batch-job staging while preserving
-// staging used by detached workspace containers.
 func PruneBatchStaging(cacheDir string, workspaceIDs map[string]bool) error {
 	customAssetCacheMu.Lock()
 	defer customAssetCacheMu.Unlock()
@@ -480,8 +470,7 @@ func downloadFileWithProgress(ctx context.Context, url, dest string, progress fu
 		return err
 	}
 
-	// Add HuggingFace auth token if downloading from HF (gated models need this)
-	if strings.Contains(url, "huggingface.co") || strings.Contains(url, "hf.co") {
+	if shouldAttachHuggingFaceToken(req.URL) {
 		if token := hfToken(); token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -521,8 +510,7 @@ func downloadFileWithProgress(ctx context.Context, url, dest string, progress fu
 	progressWriter := &downloadProgressWriter{total: resp.ContentLength, lastPercent: -1, progress: progress}
 	writer := io.MultiWriter(f, progressWriter)
 	if limit > 0 {
-		// Read one byte past the limit so we can detect an over-cap stream even
-		// when Content-Length was missing or understated.
+
 		n, copyErr := io.Copy(writer, io.LimitReader(resp.Body, limit+1))
 		if copyErr != nil {
 			return copyErr
@@ -543,8 +531,6 @@ func downloadFileWithProgress(ctx context.Context, url, dest string, progress fu
 	return nil
 }
 
-// UploadOutput uploads a file to the given pre-signed URL (PUT).
-// Returns the public URL of the uploaded file.
 func UploadOutput(ctx context.Context, filePath, uploadURL string) error {
 	if uploadURL == "" {
 		return nil
@@ -607,15 +593,9 @@ func outputContentType(filePath string) string {
 	}
 }
 
-// BuildMounts creates the Docker volume mount arguments from the staging dir.
-// Maps custom file paths into the container at the expected locations.
-func BuildMounts(cacheDir, stagingDir string, files []types.CustomFile) []string {
-	mounts := []string{
-		cacheDir + ":/cache",
-	}
-
+func BuildMounts(stagingDir string, files []types.CustomFile) []string {
+	var mounts []string
 	if len(files) > 0 && stagingDir != "" {
-		// Mount the entire staging dir so all custom files are accessible
 		mounts = append(mounts, stagingDir+":/custom:ro")
 	}
 

@@ -138,8 +138,7 @@ func TestSaveCreatesFileWith0600(t *testing.T) {
 	}
 
 	perm := info.Mode().Perm()
-	// On Unix, should be 0600 (owner read/write only).
-	// On Windows, file permissions work differently — skip the check.
+
 	if configPermissionsNeedWarning(runtime.GOOS, perm) {
 		t.Errorf("config file permissions = %o, want 0600 (no group/other access)", perm)
 	}

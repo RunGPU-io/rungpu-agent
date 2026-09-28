@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,11 +24,22 @@ import (
 var guiHTML []byte
 
 type guiController struct {
-	mu       sync.Mutex
-	logs     strings.Builder
-	busy     string
-	running  bool
-	lastPing time.Time
+	mu         sync.Mutex
+	logs       strings.Builder
+	busy       string
+	running    bool
+	lastPing   time.Time
+	authority  string
+	origin     string
+	capability string
+}
+
+func newGUICapability() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate GUI capability: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func parseEnrollmentInput(raw string) string {
@@ -53,12 +67,21 @@ func supportsDesktopGUI() bool {
 }
 
 func runGUI() error {
-	ctrl := &guiController{lastPing: time.Now()}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("open agent window: %w", err)
 	}
-	url := "http://" + listener.Addr().String()
+	capability, err := newGUICapability()
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	authority := listener.Addr().String()
+	origin := "http://" + authority
+	ctrl := &guiController{
+		lastPing: time.Now(), authority: authority, origin: origin, capability: capability,
+	}
+	url := origin + "/?token=" + capability
 	if launchedWithoutSharedConsole() {
 		hideOwnConsole()
 	} else {
@@ -227,7 +250,45 @@ func (c *guiController) handler() http.Handler {
 		c.appendLog("Schedule updated.\n")
 		c.writeState(w)
 	})
-	return mux
+	return c.authorize(mux)
+}
+
+func (c *guiController) authorize(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+
+		if c.capability == "" || c.authority == "" || c.origin == "" || r.Host != c.authority {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && origin != c.origin {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		provided := r.Header.Get("X-RunGPU-GUI-Token")
+		if provided == "" && r.URL.Path == "/" {
+			provided = r.URL.Query().Get("token")
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(c.capability)) != 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		expectedMethod := http.MethodPost
+		if r.URL.Path == "/" || r.URL.Path == "/api/state" || r.URL.Path == "/api/ping" {
+			expectedMethod = http.MethodGet
+		}
+		if r.Method != expectedMethod {
+			w.Header().Set("Allow", expectedMethod)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (c *guiController) startAgent() {
@@ -279,6 +340,7 @@ func (c *guiController) withOutput(fn func() error) error {
 	os.Stdout, os.Stderr = writer, writer
 	done := make(chan struct{})
 	go func() {
+		defer reader.Close()
 		_, _ = io.Copy(guiLogWriter{ctrl: c}, reader)
 		close(done)
 	}()
@@ -335,7 +397,7 @@ func (c *guiController) snapshot() map[string]any {
 		windows = normalized.Windows
 	}
 	if !c.running {
-		earning = config.EarningStatus{Mode: config.EarningStopped, Summary: "Ready — click Start to earn"}
+		earning = config.EarningStatus{Mode: config.EarningStopped, Summary: "Enrolled — click Start to connect"}
 	}
 	return map[string]any{
 		"version":           version,

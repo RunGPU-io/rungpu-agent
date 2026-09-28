@@ -12,19 +12,31 @@ import (
 
 func TestJobResultAckOnlyRemovesAcceptedResult(t *testing.T) {
 	client := &Client{outboxDir: t.TempDir()}
+	client.queueResult(types.JobResult{Type: "job_result", JobID: "job-1"})
 	resultPath := filepath.Join(client.outboxDir, "job-1.json")
-	if err := os.WriteFile(resultPath, []byte(`{"job_id":"job-1"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 
-	client.dispatch(context.Background(), make(chan interface{}, 1), []byte(`{"type":"job_result_ack","job_id":"job-1","success":false}`))
-	if _, err := os.Stat(resultPath); err != nil {
-		t.Fatalf("rejected result ACK removed durable result: %v", err)
+	for _, ack := range []string{
+		`{"type":"job_result_ack","job_id":"job-1","success":false}`,
+		`{"type":"job_result_ack","job_id":"job-1"}`,
+		`{"type":"job_result_ack","success":true}`,
+		`{"type":"job_result_ack","job_id":"other-job","success":true}`,
+		`{"type":"job_result_ack","job_id":"job-1","success":"true"}`,
+	} {
+		client.dispatch(context.Background(), make(chan interface{}, 1), []byte(ack))
+		if _, err := os.Stat(resultPath); err != nil {
+			t.Fatalf("unaccepted result ACK removed durable result: %v", err)
+		}
+		if len(client.results) != 1 {
+			t.Fatal("unaccepted ACK removed pending result")
+		}
 	}
 
 	client.dispatch(context.Background(), make(chan interface{}, 1), []byte(`{"type":"job_result_ack","job_id":"job-1","success":true}`))
 	if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
 		t.Fatalf("accepted result ACK did not remove durable result: %v", err)
+	}
+	if len(client.results) != 0 {
+		t.Fatal("accepted ACK did not remove pending result")
 	}
 }
 

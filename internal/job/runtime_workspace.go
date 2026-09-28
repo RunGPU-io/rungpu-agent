@@ -12,30 +12,12 @@ import (
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
-// workspaceRuntime runs a long-lived container the coordinator assigned.
-// Unlike batch jobs that exit, it stays up for the rental with the assigned ports.
-//
-// Storage strategy — Docker named volumes for persistence:
-//
-//	Models, custom nodes, and other large assets are stored in Docker named
-//	volumes. These survive container removal
-//	and are reused across jobs, so a large asset downloaded once is
-//	available instantly for every subsequent job. The host never re-downloads
-//	models it already has.
-//
-//	Per-job workspace data (user files, outputs) uses a separate bind mount
-//	so it can be cleaned up when the rental ends.
-//
-// The assignment specifies docker_image, ports, and an optional command.
-//
-// The agent starts the container, reports the access URL back, and keeps it
-// running until the rental ends (stop signal from the pool coordinator).
 type workspaceRuntime struct {
 	docker    *dockermgr.Manager
 	cacheDir  string
 	useGPU    bool
 	gpuDevice string
-	hostIP    string // the host's external IP for access URLs
+	hostIP    string
 }
 
 func newWorkspaceRuntime(cacheDir string, useGPU bool, gpuDevice string, policy dockermgr.SecurityPolicy) *workspaceRuntime {
@@ -50,7 +32,6 @@ func newWorkspaceRuntime(cacheDir string, useGPU bool, gpuDevice string, policy 
 
 func (r *workspaceRuntime) Name() string { return "workspace" }
 
-// resolveWorkspace figures out the Docker image, ports, and settings for a job.
 func resolveWorkspace(a types.JobAssignment) (image string, ports []string, shmSize string, volumes map[string]string, cmd []string) {
 	params := a.Parameters
 	if params == nil {
@@ -75,7 +56,6 @@ func resolveWorkspace(a types.JobAssignment) (image string, ports []string, shmS
 		}
 	}
 
-	// Override shm_size
 	if s, ok := params["shm_size"].(string); ok && s != "" {
 		shmSize = s
 	}
@@ -83,7 +63,6 @@ func resolveWorkspace(a types.JobAssignment) (image string, ports []string, shmS
 		shmSize = "4g"
 	}
 
-	// Override command
 	if c, ok := params["command"].(string); ok && c != "" {
 		cmd = strings.Fields(c)
 	}
@@ -97,7 +76,6 @@ func (r *workspaceRuntime) Prepare(ctx context.Context, a types.JobAssignment) e
 		return fmt.Errorf("workspace assignment requires docker_image")
 	}
 
-	// Enforce the image allowlist before pulling (fail fast, don't pull untrusted).
 	if err := dockermgr.ValidateImage(image, dockermgr.WithAssignedImage(r.docker.Policy, image)); err != nil {
 		return fmt.Errorf("security: %w", err)
 	}
@@ -106,7 +84,6 @@ func (r *workspaceRuntime) Prepare(ctx context.Context, a types.JobAssignment) e
 		return fmt.Errorf("docker is not available — install Docker to run workspace containers")
 	}
 
-	// Pull image if not present
 	out, err := exec.CommandContext(ctx, "docker", "image", "inspect", image).CombinedOutput()
 	if err != nil || len(out) < 3 {
 		fmt.Printf("[workspace] Pulling image %s...\n", image)
@@ -126,10 +103,10 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 	}
 
 	containerName := WorkspaceContainerName(a.JobID)
+	if a.ResourceName != "" {
+		containerName = a.ResourceName
+	}
 
-	// Bind exposed ports to loopback only. An unauthenticated workspace
-	// bound to 0.0.0.0 would be reachable by anyone on the host's network;
-	// access is instead brokered through the agent's outbound connection.
 	ports = bindPortsLoopback(ports)
 
 	env := map[string]string{
@@ -147,7 +124,6 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 		}
 	}
 
-	// Per-job workspace bind mount (user files, scratch space)
 	workspaceDir := r.cacheDir + "/workspaces/" + a.JobID
 	mounts := []string{workspaceDir + ":/workspace"}
 	if len(a.CustomFiles) > 0 {
@@ -155,9 +131,6 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 		mounts = append(mounts, stagingDir+":/custom:ro")
 	}
 
-	// Persistent Docker named volumes — survive container removal.
-	// Models, custom nodes, extensions, etc. are stored here so they
-	// never need to be re-downloaded.
 	var namedVolumes []string
 	var volumeInfo []string
 	if persistVolumes != nil {
@@ -172,35 +145,37 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 	}
 
 	containerID, err := r.docker.Run(ctx, dockermgr.RunOptions{
-		Image:     image,
-		Name:      containerName,
-		Network:   "bridge",
-		UseGPU:    r.useGPU,
-		GPUDevice: r.gpuDevice,
-		Ports:     ports,
-		Mounts:    mounts,
-		Volumes:   namedVolumes,
-		Env:       env,
-		ShmSize:   shmSize,
-		Command:   cmd,
+		Image:            image,
+		Name:             containerName,
+		Labels:           a.ResourceLabels,
+		ExpectedDaemonID: a.ResourceDaemonID,
+		Network:          "bridge",
+		UseGPU:           r.useGPU,
+		GPUDevice:        r.gpuDevice,
+		Ports:            ports,
+		Mounts:           mounts,
+		Volumes:          namedVolumes,
+		Env:              env,
+		ShmSize:          shmSize,
+		Command:          cmd,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to start workspace %s: %w", image, err)
 	}
 
-	// Wait briefly for the container to start
 	time.Sleep(3 * time.Second)
 
-	// Check it's actually running
 	running, _, err := r.docker.Inspect(ctx, containerName)
 	if err != nil || !running {
 		logs, _ := r.docker.Logs(ctx, containerName, 50)
-		_ = r.docker.Remove(context.Background(), containerName)
+		if a.ResourceName != "" {
+			_ = r.docker.RemoveOwnedAndVerify(context.Background(), dockermgr.OwnedResource{Name: containerName, Labels: a.ResourceLabels, DaemonID: a.ResourceDaemonID})
+		} else {
+			_ = r.docker.Remove(context.Background(), containerName)
+		}
 		return nil, fmt.Errorf("workspace container failed to start:\n%s", logs)
 	}
 
-	// Build access URLs (host port is the second-to-last colon field once bound
-	// to loopback, e.g. "127.0.0.1:8188:8188").
 	accessURLs := make([]string, 0, len(ports))
 	for _, p := range ports {
 		if hp := hostPortOf(p); hp != "" {
@@ -219,7 +194,6 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 		"message":      fmt.Sprintf("Workspace is running. Access at: %s", strings.Join(accessURLs, ", ")),
 	}
 
-	// Report persistent volumes so the user knows what's cached
 	if len(namedVolumes) > 0 {
 		result["persistent_volumes"] = namedVolumes
 		result["storage_note"] = "Models and custom nodes are stored in Docker named volumes. " +
@@ -229,9 +203,6 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 	return result, nil
 }
 
-// bindPortsLoopback rewrites each port spec to bind on 127.0.0.1 so exposed
-// workspace services aren't reachable on the host's public interfaces.
-// Accepts "CP", "HP:CP", or "IP:HP:CP" and returns "127.0.0.1:HP:CP".
 func bindPortsLoopback(ports []string) []string {
 	out := make([]string, 0, len(ports))
 	for _, p := range ports {
@@ -254,8 +225,6 @@ func bindPortsLoopback(ports []string) []string {
 	return out
 }
 
-// hostPortOf extracts the host port from a docker port spec
-// ("CP", "HP:CP", or "IP:HP:CP").
 func hostPortOf(p string) string {
 	f := strings.Split(strings.TrimSpace(p), ":")
 	switch len(f) {
@@ -269,9 +238,6 @@ func hostPortOf(p string) string {
 }
 
 func (r *workspaceRuntime) Cleanup(force bool) error {
-	// Workspaces are cleaned up when the rental ends (via pool coordinator).
-	// Named volumes are intentionally NOT cleaned up here — they're the
-	// persistent model cache that makes subsequent jobs fast.
-	// To reclaim space: docker volume prune
+
 	return nil
 }

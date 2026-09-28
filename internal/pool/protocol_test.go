@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
+	"github.com/gorilla/websocket"
 )
 
 func TestHeartbeatSent(t *testing.T) {
@@ -84,9 +84,13 @@ func TestJobDispatchAndResult(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.ReadMessage() // register
+		conn.ReadMessage()
+		conn.WriteJSON(map[string]interface{}{
+			"type": "gpu_register_ack", "success": true,
+		})
 		conn.WriteJSON(map[string]interface{}{
 			"type": "job_assignment", "job_id": "j1",
+			"runtime":    "ollama",
 			"model_name": "test", "input": map[string]interface{}{"prompt": "hi"},
 			"parameters": map[string]interface{}{}, "vram_required_gb": 1.0,
 		})
@@ -110,13 +114,14 @@ func TestJobDispatchAndResult(t *testing.T) {
 		ModelCacheDir: t.TempDir(), MaxModelCacheGB: 1,
 		HeartbeatIntervalSecs: 60,
 	}
-	client, _ := NewClient(cfg)
+	client := newOfflineFixtureClient(t, cfg, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	go func() { _ = client.Run(ctx) }()
 
 	select {
 	case r := <-resultCh:
+		assertFixtureResponse(t, r, "hi")
 		if r["type"] != "job_result" {
 			t.Errorf("type = %v", r["type"])
 		}

@@ -1,5 +1,3 @@
-// Package config loads/saves the agent YAML config and creates a default
-// config (including GPU auto-detection) on `init`.
 package config
 
 import (
@@ -9,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 
+	"github.com/RunGPU-io/rungpu-agent/internal/durablefs"
 	"github.com/RunGPU-io/rungpu-agent/internal/gpu"
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 	"gopkg.in/yaml.v3"
@@ -19,8 +19,6 @@ import (
 
 const DefaultPoolURL = "https://rungpu-pool-api-420004393585.us-central1.run.app"
 
-// DefaultConfigPath returns the cross-platform default config location:
-// ~/.tokenize/config.yaml (Windows: %USERPROFILE%\.tokenize\config.yaml).
 func DefaultConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -29,54 +27,66 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".tokenize", "config.yaml")
 }
 
-// LoadOrCreateInstallationID returns a stable, non-secret ID used to make
-// batch enrollment retries idempotent before the machine has credentials.
 func LoadOrCreateInstallationID(configPath string) (string, error) {
-	path := filepath.Join(filepath.Dir(configPath), "installation-id")
-	if existing, err := os.ReadFile(path); err == nil {
-		id := strings.TrimSpace(string(existing))
-		if id != "" {
-			return id, nil
+	return loadOrCreateIdentity(configPath, "installation-id",
+		`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`, randomUUID)
+}
+
+func LoadOrCreateInstallationSecret(configPath string) (string, error) {
+	return loadOrCreateIdentity(configPath, "installation-secret", `^[A-Za-z0-9_-]{43}$`, func() (string, error) {
+		random := make([]byte, 32)
+		if _, err := rand.Read(random); err != nil {
+			return "", err
 		}
+		return base64.RawURLEncoding.EncodeToString(random), nil
+	})
+}
+
+func loadOrCreateIdentity(configPath, name, pattern string, generate func() (string, error)) (string, error) {
+	path := filepath.Join(filepath.Dir(configPath), name)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", err
 	}
-	id, err := randomUUID()
+	read := func() (string, error) {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", err
+		}
+		if !info.Mode().IsRegular() || configPermissionsNeedWarning(runtime.GOOS, info.Mode()) {
+			return "", fmt.Errorf("%s must be a private regular file (Unix permissions 600); preserve this file for enrollment recovery", path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		value := strings.TrimSpace(string(data))
+		if !regexp.MustCompile(pattern).MatchString(value) {
+			return "", fmt.Errorf("invalid %s; restore the original installation file or request replacement enrollment", path)
+		}
+		return value, nil
+	}
+	if value, err := read(); err == nil || !os.IsNotExist(err) {
+		return value, err
+	}
+	value, err := generate()
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	staged, err := stagePrivateFile(path, []byte(value+"\n"))
+	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, []byte(id+"\n"), 0600); err != nil {
+	defer os.Remove(staged)
+
+	if err := os.Link(staged, path); err != nil && !os.IsExist(err) {
 		return "", err
 	}
-	return id, nil
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return "", err
+	}
+	return read()
 }
 
-// LoadOrCreateInstallationSecret returns a private random value proving that a
-// batch retry comes from the installation that claimed the original slot.
-func LoadOrCreateInstallationSecret(configPath string) (string, error) {
-	path := filepath.Join(filepath.Dir(configPath), "installation-secret")
-	if existing, err := os.ReadFile(path); err == nil {
-		secret := strings.TrimSpace(string(existing))
-		if secret != "" {
-			return secret, nil
-		}
-	}
-	random := make([]byte, 32)
-	if _, err := rand.Read(random); err != nil {
-		return "", err
-	}
-	secret := base64.RawURLEncoding.EncodeToString(random)
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(path, []byte(secret+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return secret, nil
-}
-
-// New builds a default config, auto-detecting local GPUs.
 func New(apiKey string) (*types.Config, error) {
 	machineID, err := randomUUID()
 	if err != nil {
@@ -147,15 +157,12 @@ func RefreshGPUIDs(cfg *types.Config) {
 	}
 }
 
-// Load reads and parses a config file. Warns if the file has insecure
-// permissions (the config contains a machine-scoped credential).
 func Load(path string) (*types.Config, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("config file not found at %s: %w", path, err)
 	}
 
-	// Check permissions on Unix — warn if group/other can read the credential.
 	if mode := info.Mode().Perm(); configPermissionsNeedWarning(runtime.GOOS, mode) {
 		fmt.Fprintf(os.Stderr,
 			"WARNING: config file %s has permissions %o — should be 600 (contains a machine credential).\n"+
@@ -177,23 +184,99 @@ func configPermissionsNeedWarning(goos string, mode os.FileMode) bool {
 	return goos != "windows" && mode.Perm()&0o077 != 0
 }
 
-// Save writes the config to disk with helpful comments, creating parent
-// directories as needed. The file is written with 0600 permissions since it
-// contains the machine credential.
 func Save(cfg *types.Config, path string) error {
-	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
+	if err := checkSavePath(path); err != nil {
+		return err
 	}
-
-	// Write a commented config so users can easily edit it.
 	content := generateCommentedConfig(cfg)
-	return os.WriteFile(path, []byte(content), 0o600)
+	staged, err := stagePrivateFile(path, []byte(content))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staged)
+	return durablefs.Replace(staged, path)
 }
 
-// generateCommentedConfig produces a human-readable YAML config with inline
-// documentation for every field. This is what `init` writes and what users edit.
+func checkSavePath(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("config destination %s must be a regular file, not a directory or symlink", path)
+	}
+	return nil
+}
+
+func PreflightSave(path string) error {
+	if err := checkSavePath(path); err != nil {
+		return err
+	}
+	first, err := stagePrivateFile(path, []byte("enrollment persistence check\n"))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(first)
+	second, err := stagePrivateFile(path, nil)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(second)
+	return durablefs.Replace(first, second)
+}
+
+func stagePrivateFile(path string, data []byte) (string, error) {
+	file, err := os.CreateTemp(filepath.Dir(path), ".enrollment-write-*")
+	if err != nil {
+		return "", err
+	}
+	name := file.Name()
+	ok := false
+	defer func() {
+		file.Close()
+		if !ok {
+			os.Remove(name)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return name, nil
+}
+
+func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func LockEnrollment(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	lock := filepath.Join(filepath.Dir(path), ".enrollment.lock")
+	if err := os.Mkdir(lock, 0700); err != nil {
+		return nil, fmt.Errorf("cannot lock enrollment at %s: %w; wait for the other init/GUI enrollment, or remove this lock directory only after confirming none is running", lock, err)
+	}
+	return func() { _ = os.Remove(lock) }, nil
+}
+
 func generateCommentedConfig(cfg *types.Config) string {
 	gpuIDs := ""
 	for _, id := range cfg.GPUIDs {
@@ -235,6 +318,10 @@ price_per_minute: %.4f
 # Where downloaded models are stored on disk. Models are cached so repeat
 # jobs don't re-download. Needs fast storage (SSD recommended).
 model_cache_dir: %q
+
+# Pins the durable execution journal under model_cache_dir/executions.
+# Managed by the agent. Keep this ID and journal together; do not reset or delete.
+execution_journal_id: %q
 
 # Maximum disk space for cached models (GB). Old models are cleaned up
 # automatically when this limit is reached (LRU eviction).
@@ -323,6 +410,7 @@ security:
 		cfg.GPUDevice,
 		cfg.PricePerMinute,
 		cfg.ModelCacheDir,
+		cfg.ExecutionJournalID,
 		cfg.MaxModelCacheGB,
 		cfg.CleanupIntervalHours,
 		cfg.CustomAssetTTLDays,
@@ -344,8 +432,6 @@ security:
 	)
 }
 
-// ApplyDefaults fills in any missing fields with sensible defaults so a
-// minimal config (just api_key) is enough to start the agent.
 func ApplyDefaults(cfg *types.Config) {
 	if key := strings.TrimSpace(os.Getenv("RUNGPU_AGENT_KEY")); key != "" {
 		cfg.APIKey = key
@@ -432,12 +518,11 @@ func formatScheduleWindows(sched types.ScheduleConfig) string {
 	return b.String()
 }
 
-// Validate checks required fields.
 func Validate(cfg *types.Config) error {
 	if cfg.APIKey == "" {
 		return fmt.Errorf("machine credential is empty — enroll this host or set RUNGPU_AGENT_KEY")
 	}
-	// Auto-fill everything else so a minimal config works.
+
 	ApplyDefaults(cfg)
 	return nil
 }

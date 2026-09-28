@@ -52,7 +52,12 @@
     }
     .error { color: var(--danger); font-size: 12px; min-height: 16px; }
     .hint { color: var(--muted); font-size: 12px; }
+    a { color: var(--accent); }
     .card { padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
+    .tutorial { margin-bottom: 12px; }
+    .tutorial p { margin: 0 0 8px; }
+    .tutorial ol { margin: 0 0 8px; padding-left: 22px; }
+    .tutorial li { margin: 4px 0; }
     .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
     .check input { width: auto; }
     .window { border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-top: 10px; }
@@ -80,6 +85,16 @@
     <div class="hint" id="summary-next"></div>
   </div>
   <div id="token-wrap">
+    <div class="card tutorial">
+      <p><strong>Connect this computer</strong></p>
+      <ol>
+        <li><a href="https://www.rungpu.io/marketplace/host" target="_blank" rel="noopener noreferrer">Open the host dashboard</a> and create a listing for this computer.</li>
+        <li>Copy its one-time enrollment token or full <code>init</code> command.</li>
+        <li>Paste it below and click <strong>Enroll</strong>.</li>
+        <li>Click <strong>Setup</strong>, then <strong>Start</strong>.</li>
+      </ol>
+      <p class="hint">Enterprise batch token files use the headless <code>init --batch-token-file</code> command instead.</p>
+    </div>
     <label for="token">Enrollment token</label>
     <input id="token" spellcheck="false" autocomplete="off" placeholder="Paste the token or the full init command">
   </div>
@@ -145,8 +160,13 @@
       save: document.getElementById("save-schedule"),
     };
 
+    const guiToken = new URLSearchParams(window.location.search).get("token") || "";
+
     async function api(path, options) {
-      const res = await fetch(path, options);
+      const request = options || {};
+      const headers = new Headers(request.headers || {});
+      headers.set("X-RunGPU-GUI-Token", guiToken);
+      const res = await fetch(path, { ...request, headers });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || res.statusText);
       return data;
@@ -159,10 +179,10 @@
       summary.className = "status " + mode;
       summary.querySelector("strong").textContent = state.running
         ? (state.earning || "Agent running")
-        : (state.enrolled ? "Ready — click Start to earn" : "Not enrolled");
+        : (state.enrolled ? "Enrolled — click Start to connect" : "Not enrolled");
       summaryNext.textContent = [
         state.enrolled ? ("Enrolled" + (state.machine_id ? " · " + state.machine_id : "")) : "Not enrolled",
-        state.running ? "Connected to the pool" : "Not connected yet",
+        state.running ? "Agent process started" : "Not connected yet",
         state.earning_next || "",
       ].filter(Boolean).join(" · ");
       if (state.logs) log.value = state.logs;
@@ -338,8 +358,7 @@
     };
 
     setInterval(() => {
-      fetch("/api/ping", { method: "POST" }).catch(() => {});
-      refresh().catch(() => {});
+      api("/api/ping").then(render).catch(() => {});
     }, 2000);
     refresh().catch((err) => { error.textContent = err.message; });
   </script>
