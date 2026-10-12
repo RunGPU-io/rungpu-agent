@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RunGPU-io/rungpu-agent/internal/config"
+	"github.com/RunGPU-io/rungpu-agent/internal/pool"
 )
 
 func newTestGUIController() *guiController {
@@ -200,7 +203,7 @@ func TestGUIServesHTML(t *testing.T) {
 		"Open the host dashboard",
 		"Paste the token or the full init command",
 		"init --batch-token-file",
-		`api("/api/ping").then(render)`,
+		`refresh("/api/ping").catch(showStateError)`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("html missing %q", want)
@@ -297,6 +300,105 @@ func TestGUIScheduleUpdatesConfig(t *testing.T) {
 	text := string(data)
 	if !strings.Contains(text, "enabled: true") || !strings.Contains(text, "America/Los_Angeles") {
 		t.Fatalf("schedule not saved: %s", text)
+	}
+}
+
+func TestGUIScheduleRejectsInvalidRequestsWithoutChangingConfig(t *testing.T) {
+	for _, body := range []string{
+		`{not-json`,
+		``,
+		`null`,
+		`{}`,
+		`{"enabled":null}`,
+		`{"enabled":"false"}`,
+		`{"enabled":false} {}`,
+		`{"enabled":false} trailing`,
+		`{"enabled":false,"unknown":1}`,
+		`{"enabled":true}`,
+		`{"enabled":true,"windows":[]}`,
+		`{"enabled":true,"windows":[{"start_hour":9}]}`,
+		`{"enabled":true,"start_hour":9}`,
+		`{"enabled":true,"windows":[{"start_hour":-1,"end_hour":17}]}`,
+		`{"enabled":true,"windows":[{"start_hour":9,"end_hour":24}]}`,
+		`{"enabled":true,"windows":[{"start_hour":9,"end_hour":17,"days":["mon","oops"]}]}`,
+		`{"enabled":false,"timezone":"Not/A_Timezone"}`,
+		`{"enabled":false,"timezone":"` + strings.Repeat("x", 64<<10) + `"}`,
+	} {
+		t.Run(body[:min(len(body), 80)], func(t *testing.T) {
+			home := isolateAgentHome(t)
+			original := "api_key: test-key\nmachine_id: test-machine\nschedule:\n  enabled: true\n  timezone: UTC\n  start_hour: 9\n  end_hour: 17\n"
+			path := writeAgentConfig(t, home, original)
+			ctrl := newTestGUIController()
+			rec := httptest.NewRecorder()
+			serveGUI(ctrl, rec, httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, body=%s", rec.Code, rec.Body.String())
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != original {
+				t.Fatalf("invalid request changed config: err=%v", err)
+			}
+			if ctrl.logs.Len() != 0 {
+				t.Fatal("invalid request logged a successful update")
+			}
+		})
+	}
+}
+
+func TestGUIScheduleSavesDisabledDraftAndLegacyWindow(t *testing.T) {
+	home := isolateAgentHome(t)
+	path := writeAgentConfig(t, home, "api_key: test-key\nmachine_id: test-machine\nschedule:\n  enabled: true\n  timezone: UTC\n  start_hour: 9\n  end_hour: 17\n")
+	ctrl := newTestGUIController()
+	for _, body := range []string{
+		`{"enabled":false,"timezone":"","windows":[{"start_hour":22,"end_hour":6,"days":["fri"]}]}`,
+		`{"enabled":true,"start_hour":22,"end_hour":6}`,
+		`{"enabled":false}`,
+	} {
+		rec := httptest.NewRecorder()
+		serveGUI(ctrl, rec, httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, body=%s", rec.Code, rec.Body.String())
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		schedule := config.NormalizeSchedule(cfg.Schedule)
+		if schedule.Timezone != "" || schedule.StartHour != 22 || schedule.EndHour != 6 {
+			t.Fatalf("schedule=%+v", schedule)
+		}
+		if schedule.Enabled != strings.Contains(body, `"enabled":true`) {
+			t.Fatalf("enabled=%v for %s", schedule.Enabled, body)
+		}
+	}
+}
+
+func TestGUIEnrollRejectsMalformedJSONBeforeEnrollment(t *testing.T) {
+	home := isolateAgentHome(t)
+	for _, body := range []string{`{"token":"test-token"`, `{"token":"test-token"} {}`, `null`} {
+		rec := httptest.NewRecorder()
+		serveGUI(newTestGUIController(), rec, httptest.NewRequest(http.MethodPost, "/api/enroll", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d", rec.Code)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".tokenize")); !os.IsNotExist(err) {
+		t.Fatalf("invalid enrollment created installation files: %v", err)
+	}
+}
+
+func TestGUIStateDoesNotTreatProcessAsConnected(t *testing.T) {
+	home := isolateAgentHome(t)
+	writeAgentConfig(t, home, "api_key: test-key\nmachine_id: test-machine\n")
+	ctrl := newTestGUIController()
+	ctrl.running = true
+	ctrl.clients = []*pool.Client{{}, {}}
+	state := ctrl.snapshot()
+	if state["connected_workers"] != 0 || state["total_workers"] != 2 {
+		t.Fatalf("worker status=%+v", state)
+	}
+	if state["schedule_status"] != "Schedule allows work" || state["earning"] == "Earning" {
+		t.Fatalf("schedule is presented as paid work: %+v", state)
 	}
 }
 

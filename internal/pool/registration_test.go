@@ -119,6 +119,36 @@ func registrationClient(t *testing.T) *Client {
 	return c
 }
 
+func TestConnectedRequiresRegistrationAndClearsOnDisconnect(t *testing.T) {
+	c := registrationClient(t)
+	p := connectRegistrationPeer(t, c, 5*time.Second)
+	if c.Connected() {
+		t.Fatal("transport without registration reported connected")
+	}
+	p.send(t, `{"type":"gpu_register_ack","success":true}`)
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.Connected() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !c.Connected() {
+		t.Fatal("accepted registration did not report connected")
+	}
+	_ = p.conn.Close()
+	p.stopped(t)
+	if c.Connected() {
+		t.Fatal("disconnected worker still reported connected")
+	}
+	next := connectRegistrationPeer(t, c, 5*time.Second)
+	if c.Connected() {
+		t.Fatal("reconnect reported connected before its own registration")
+	}
+	next.send(t, `{"type":"gpu_register_ack","success":false,"error":"denied"}`)
+	next.stopped(t)
+	if c.Connected() {
+		t.Fatal("rejected registration reported connected")
+	}
+}
+
 func TestRegistrationDelayedAckGatesDiskBacklogAndBestEffort(t *testing.T) {
 	c := registrationClient(t)
 	const count = 2*resultBatchSize + 7

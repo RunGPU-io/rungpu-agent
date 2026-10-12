@@ -1,6 +1,7 @@
 package job
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,8 @@ import (
 )
 
 const runtimeSmokeModel = "qwen2.5:0.5b"
+
+const runtimeSmokeDockerImage = "ghcr.io/ggml-org/llama.cpp:light@sha256:fb372b4d0fb8403c234fdb91df8085914642bf14bfe1b09d9190fa8aadd95393"
 
 func requireRuntimeSmoke(t *testing.T) {
 	t.Helper()
@@ -62,17 +66,14 @@ func TestRuntimeSmoke_DockerInference(t *testing.T) {
 		t.Fatalf("Docker daemon is required for runtime smoke tests: %v", err)
 	}
 
-	const (
-		image    = "ghcr.io/ggml-org/llama.cpp:light"
-		modelURL = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
-	)
+	const modelURL = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 	containerName := fmt.Sprintf("rungpu-runtime-smoke-%d", time.Now().UnixNano())
 	cleanup := exec.Command("docker", "rm", "--force", containerName)
 	t.Cleanup(func() { _ = cleanup.Run() })
 
 	pullContext, cancelPull := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancelPull()
-	if output, err := exec.CommandContext(pullContext, "docker", "pull", image).CombinedOutput(); err != nil {
+	if output, err := exec.CommandContext(pullContext, "docker", "pull", runtimeSmokeDockerImage).CombinedOutput(); err != nil {
 		t.Fatalf("pull llama.cpp image: %v\n%s", err, output)
 	}
 
@@ -115,17 +116,33 @@ func TestRuntimeSmoke_DockerInference(t *testing.T) {
 
 	inferenceContext, cancelInference := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancelInference()
-	output, err := exec.CommandContext(inferenceContext, "docker", "run", "--rm",
+	if err := runDockerSmokeInference(inferenceContext, containerName, modelPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func dockerSmokeInferenceArgs(containerName, modelPath string) []string {
+	return []string{"run", "--rm",
 		"--name", containerName, "--log-driver", "none",
-		"--volume", modelPath+":/models/model.gguf:ro", image,
+		"--volume", modelPath + ":/models/model.gguf:ro",
+
+		"--entrypoint", "/app/llama-completion", runtimeSmokeDockerImage,
 		"--model", "/models/model.gguf",
 		"--prompt", "What is 2+2? Answer with only the number.",
 		"--predict", "8", "--temp", "0", "--no-display-prompt",
-		"--single-turn", "--simple-io").CombinedOutput()
-	if err != nil {
-		t.Fatalf("run Docker llama.cpp inference: %v\n%s", err, output)
+		"--single-turn", "--simple-io"}
+}
+
+func runDockerSmokeInference(ctx context.Context, containerName, modelPath string) error {
+	cmd := exec.CommandContext(ctx, "docker", dockerSmokeInferenceArgs(containerName, modelPath)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run Docker llama.cpp inference: %w\nstdout: %s\nstderr: %s", err, &stdout, &stderr)
 	}
-	if !strings.Contains(string(output), "4") {
-		t.Fatalf("unexpected Docker inference response: %q", output)
+
+	if !regexp.MustCompile(`\b4\b`).Match(stdout.Bytes()) {
+		return fmt.Errorf("unexpected Docker inference response: %q\nstderr: %s", &stdout, &stderr)
 	}
+	return nil
 }

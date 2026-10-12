@@ -718,6 +718,10 @@ func enrollmentURL(poolURL, endpoint string) (*url.URL, error) {
 }
 
 func cmdStart(args []string) error {
+	return cmdStartWithClients(args, nil)
+}
+
+func cmdStartWithClients(args []string, onClients func([]*pool.Client)) error {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	cfgPath := fs.String("config", config.DefaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
@@ -755,6 +759,9 @@ func cmdStart(args []string) error {
 	}
 	for _, client := range clients {
 		client.SetConfigPath(*cfgPath)
+	}
+	if onClients != nil {
+		onClients(clients)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

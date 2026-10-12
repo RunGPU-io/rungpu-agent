@@ -53,6 +53,18 @@ sudo ./scripts/install.sh
 | `cleanup` | Remove agent data |
 | `version` | Show the version |
 
+### Reading the window
+
+The window shows how many GPU workers the coordinator has accepted. **Connecting
+to pool** means no worker has registered yet, or the connection is being retried.
+A connected worker is not proof of a paid job; schedule eligibility is shown
+separately. If the window cannot reach the local agent, it shows **Agent status
+unavailable**, not an old connected status.
+
+Schedule edits stay in the form while status refreshes. Click **Save schedule**
+to apply them. Failed saves keep your draft and show an error. You can also save
+windows while scheduling is disabled, then enable them later.
+
 ## You need
 
 - A GPU with about 8 GB of memory or more
@@ -66,6 +78,10 @@ Apple Macs with Apple Silicon work too.
 **Setup required.** Run `setup`, then `start`, then `status`.
 
 **Windows Docker issues.** Turn on virtualization in BIOS, install WSL 2, restart, then open Docker Desktop.
+
+**Test model execution in Docker.** The source checkout includes a Windows
+PowerShell runner. See [what it verifies and how to run it](CONTRIBUTING.md#docker-only-local-check).
+This checks a small CPU model, not GPU/CUDA or the complete agent.
 
 **Mac says the app is blocked.** Right-click `RunGPU Agent.app` and choose Open.
 

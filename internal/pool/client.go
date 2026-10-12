@@ -84,6 +84,7 @@ type Client struct {
 	outboxDir                   string
 	maintenanceGate             *sync.RWMutex
 	configPath                  string
+	connected                   atomic.Bool
 }
 
 type jobExecutor interface {
@@ -102,6 +103,10 @@ type jobExecutor interface {
 
 func (c *Client) SetConfigPath(path string) {
 	c.configPath = path
+}
+
+func (c *Client) Connected() bool {
+	return c.connected.Load()
 }
 
 func (c *Client) earningNow() config.EarningStatus {
@@ -457,8 +462,6 @@ func (c *Client) session(parent context.Context) error {
 	stopClose := context.AfterFunc(parent, func() { _ = conn.Close() })
 	defer stopClose()
 
-	log("connected to pool as %s", c.gpuID)
-
 	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 	if err := conn.WriteJSON(c.registerMessage()); err != nil {
 		return err
@@ -470,6 +473,7 @@ func (c *Client) serveConnection(parent context.Context, conn *websocket.Conn, r
 	ctx, cancel := context.WithCancel(parent)
 	writerDone := make(chan struct{})
 	defer func() {
+		c.connected.Store(false)
 		cancel()
 		_ = conn.Close()
 		<-writerDone
@@ -528,6 +532,8 @@ func (c *Client) serveConnection(parent context.Context, conn *websocket.Conn, r
 				return fmt.Errorf("registration rejected: %s", ack.Error)
 			}
 			ready = true
+			c.connected.Store(true)
+			log("registered with pool as %s", c.gpuID)
 			close(registered)
 		}
 

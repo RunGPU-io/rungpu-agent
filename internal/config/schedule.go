@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
@@ -81,6 +82,29 @@ func NormalizeSchedule(sched types.ScheduleConfig) types.ScheduleConfig {
 		sched.EndHour = clampHour(sched.EndHour)
 	}
 	return sched
+}
+
+func ValidateSchedule(sched types.ScheduleConfig) error {
+	if sched.Timezone != "" {
+		if _, err := time.LoadLocation(sched.Timezone); err != nil {
+			return fmt.Errorf("invalid schedule timezone %q", sched.Timezone)
+		}
+	}
+	windows := sched.Windows
+	if len(windows) == 0 {
+		windows = []types.ScheduleWindow{{StartHour: sched.StartHour, EndHour: sched.EndHour}}
+	}
+	for _, win := range windows {
+		if win.StartHour < 0 || win.StartHour > 23 || win.EndHour < 0 || win.EndHour > 23 {
+			return fmt.Errorf("schedule hours must be between 0 and 23")
+		}
+		for _, day := range win.Days {
+			if parseWeekday(day) == "" {
+				return fmt.Errorf("invalid schedule weekday %q", day)
+			}
+		}
+	}
+	return nil
 }
 
 func scheduleNow(sched types.ScheduleConfig, now time.Time) (time.Time, *time.Location) {

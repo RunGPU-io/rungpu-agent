@@ -142,6 +142,11 @@
     ];
     let scheduleWindows = [{ start_hour: 18, end_hour: 23, days: [] }];
     let scheduleDirty = false;
+    let scheduleRevision = 0;
+    let scheduleSaving = false;
+    let stateGeneration = 0;
+    let stateUnavailable = false;
+    let lastState = null;
     const token = document.getElementById("token");
     const log = document.getElementById("log");
     const error = document.getElementById("error");
@@ -172,23 +177,40 @@
       return data;
     }
 
-    function render(state) {
+    function markScheduleDirty() {
+      scheduleDirty = true;
+      scheduleRevision++;
+    }
+
+    document.getElementById("sched-enabled").onchange = markScheduleDirty;
+    document.getElementById("sched-tz").oninput = markScheduleDirty;
+
+    function render(state, updateSchedule = true) {
+      lastState = state;
       const rawVersion = String(state.version || "").replace(/^v/i, "");
       version.textContent = !rawVersion || /^dev/i.test(rawVersion) ? "" : "v" + rawVersion;
-      const mode = state.running ? (state.earning_mode || "earning") : "stopped";
+      const connected = Number(state.connected_workers || 0);
+      const total = Number(state.total_workers || 0);
+      const scheduledOff = state.earning_mode === "scheduled_pause";
+      const mode = !state.running ? "stopped" : connected > 0 ? "earning"
+        : state.paused ? "paused" : scheduledOff ? "scheduled_pause" : "stopped";
       summary.className = "status " + mode;
       summary.querySelector("strong").textContent = state.running
-        ? (state.earning || "Agent running")
+        ? (connected > 0 ? `${connected} of ${total} GPU workers connected`
+          : state.paused ? "Paused"
+          : scheduledOff ? "Outside scheduled hours"
+          : total > 0 ? "Connecting to pool" : "Starting agent")
         : (state.enrolled ? "Enrolled — click Start to connect" : "Not enrolled");
       summaryNext.textContent = [
         state.enrolled ? ("Enrolled" + (state.machine_id ? " · " + state.machine_id : "")) : "Not enrolled",
-        state.running ? "Agent process started" : "Not connected yet",
+        state.running ? "Agent process started" : "Agent stopped",
+        state.enrolled ? (state.schedule_status || "") : "",
         state.earning_next || "",
       ].filter(Boolean).join(" · ");
       if (state.logs) log.value = state.logs;
       log.scrollTop = log.scrollHeight;
-      document.getElementById("sched-enabled").checked = Boolean(state.schedule_enabled);
-      if (!scheduleDirty) {
+      if (updateSchedule && !scheduleDirty && !scheduleSaving) {
+        document.getElementById("sched-enabled").checked = Boolean(state.schedule_enabled);
         document.getElementById("sched-tz").value = state.schedule_timezone || "";
         if (Array.isArray(state.schedule_windows) && state.schedule_windows.length) {
           scheduleWindows = state.schedule_windows.map((win) => ({
@@ -211,17 +233,32 @@
       buttons.resume.disabled = busy || !state.running || !state.paused;
       buttons.stop.disabled = busy || !state.running;
       buttons.refresh.disabled = busy;
-      buttons.save.disabled = busy;
+      buttons.save.disabled = busy || scheduleSaving;
       document.getElementById("add-window").disabled = busy;
     }
 
-    async function refresh() {
-      const state = await api("/api/state");
-      render(state);
+    async function refresh(path = "/api/state") {
+      const generation = stateGeneration;
+      const state = await api(path);
+      if (generation === stateGeneration) {
+        if (stateUnavailable) error.textContent = "";
+        stateUnavailable = false;
+        render(state);
+      }
       return state;
     }
 
-    async function action(path, body) {
+    function showStateError(err) {
+      stateUnavailable = true;
+      summary.className = "status stopped";
+      summary.querySelector("strong").textContent = "Agent status unavailable";
+      summaryNext.textContent = "Cannot reach the local agent. Reconnecting…";
+      error.textContent = err.message;
+    }
+
+    async function action(path, body, onSuccess) {
+      stateGeneration++;
+      stateUnavailable = false;
       error.textContent = "";
       try {
         const state = await api(path, {
@@ -229,10 +266,16 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body || {}),
         });
+        stateGeneration++;
+        if (path === "/api/enroll" || path === "/api/unenroll") {
+          scheduleDirty = false;
+          scheduleRevision++;
+        }
+        if (onSuccess) onSuccess();
         render(state);
       } catch (err) {
         error.textContent = err.message;
-        refresh().catch(() => {});
+        await refresh().catch(showStateError);
       }
     }
 
@@ -304,7 +347,7 @@
             } else {
               win.days = weekdays.map((item) => item.id).filter((id) => win.days.includes(id) || id === day.id);
             }
-            scheduleDirty = true;
+            markScheduleDirty();
             renderWindows();
           };
           daysEl.append(btn);
@@ -312,21 +355,21 @@
         box.querySelectorAll("[data-repeat]").forEach((btn) => {
           btn.onclick = () => {
             win.days = btn.getAttribute("data-repeat") === "weekly" ? ["mon", "tue", "wed", "thu", "fri"] : [];
-            scheduleDirty = true;
+            markScheduleDirty();
             renderWindows();
           };
         });
         box.querySelectorAll("[data-start]").forEach((btn) => {
           btn.onclick = () => {
             win.start_hour = bumpHour(win.start_hour, Number(btn.getAttribute("data-start")));
-            scheduleDirty = true;
+            markScheduleDirty();
             renderWindows();
           };
         });
         box.querySelectorAll("[data-end]").forEach((btn) => {
           btn.onclick = () => {
             win.end_hour = bumpHour(win.end_hour, Number(btn.getAttribute("data-end")));
-            scheduleDirty = true;
+            markScheduleDirty();
             renderWindows();
           };
         });
@@ -335,7 +378,7 @@
           remove.onclick = () => {
             if (scheduleWindows.length < 2) return;
             scheduleWindows.splice(index, 1);
-            scheduleDirty = true;
+            markScheduleDirty();
             renderWindows();
           };
         }
@@ -345,22 +388,31 @@
 
     document.getElementById("add-window").onclick = () => {
       scheduleWindows.push({ start_hour: 9, end_hour: 17, days: ["mon", "tue", "wed", "thu", "fri"] });
-      scheduleDirty = true;
+      markScheduleDirty();
       renderWindows();
     };
-    buttons.save.onclick = () => {
-      scheduleDirty = false;
-      action("/api/schedule", {
+    buttons.save.onclick = async () => {
+      if (scheduleSaving) return;
+      const revision = scheduleRevision;
+      scheduleSaving = true;
+      buttons.save.disabled = true;
+      await action("/api/schedule", {
         enabled: document.getElementById("sched-enabled").checked,
         timezone: document.getElementById("sched-tz").value,
         windows: scheduleWindows,
+      }, () => {
+        if (revision === scheduleRevision) scheduleDirty = false;
+        scheduleSaving = false;
       });
+      scheduleSaving = false;
+      if (lastState && !stateUnavailable) render(lastState, false);
+      else buttons.save.disabled = false;
     };
 
     setInterval(() => {
-      api("/api/ping").then(render).catch(() => {});
+      refresh("/api/ping").catch(showStateError);
     }, 2000);
-    refresh().catch((err) => { error.textContent = err.message; });
+    refresh().catch(showStateError);
   </script>
 </body>
 </html>

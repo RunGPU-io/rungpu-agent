@@ -253,7 +253,7 @@ func TestEnrollmentSuccessDoesNotClaimConnection(t *testing.T) {
 	if strings.Contains(output, "is connected") {
 		t.Fatal("enrollment claimed an active connection")
 	}
-	if !strings.Contains(string(guiHTML), `state.running ? "Agent process started" : "Not connected yet"`) ||
+	if !strings.Contains(string(guiHTML), `state.running ? "Agent process started" : "Agent stopped"`) ||
 		!strings.Contains(string(guiHTML), "Enrolled — click Start to connect") {
 		t.Fatal("GUI must distinguish enrollment/process state from a pool connection")
 	}

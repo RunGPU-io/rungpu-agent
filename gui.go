@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/RunGPU-io/rungpu-agent/internal/config"
+	"github.com/RunGPU-io/rungpu-agent/internal/pool"
 	"github.com/RunGPU-io/rungpu-agent/internal/types"
 )
 
@@ -28,6 +29,7 @@ type guiController struct {
 	logs       strings.Builder
 	busy       string
 	running    bool
+	clients    []*pool.Client
 	lastPing   time.Time
 	authority  string
 	origin     string
@@ -148,7 +150,10 @@ func (c *guiController) handler() http.Handler {
 		var body struct {
 			Token string `json:"token"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := decodeGUIRequest(w, r, &body); err != nil {
+			c.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		token := parseEnrollmentInput(body.Token)
 		if token == "" {
 			c.writeError(w, http.StatusBadRequest, "paste the enrollment token from the host dashboard")
@@ -218,30 +223,55 @@ func (c *guiController) handler() http.Handler {
 	})
 	mux.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Enabled   bool                   `json:"enabled"`
-			Timezone  string                 `json:"timezone"`
-			Windows   []types.ScheduleWindow `json:"windows"`
-			StartHour int                    `json:"start_hour"`
-			EndHour   int                    `json:"end_hour"`
+			Enabled  *bool   `json:"enabled"`
+			Timezone *string `json:"timezone"`
+			Windows  []struct {
+				StartHour *int     `json:"start_hour"`
+				EndHour   *int     `json:"end_hour"`
+				Days      []string `json:"days"`
+			} `json:"windows"`
+			StartHour *int `json:"start_hour"`
+			EndHour   *int `json:"end_hour"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := decodeGUIRequest(w, r, &body); err != nil {
+			c.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Enabled == nil {
+			c.writeError(w, http.StatusBadRequest, "enabled must be true or false")
+			return
+		}
+		var windows []types.ScheduleWindow
+		for _, win := range body.Windows {
+			if win.StartHour == nil || win.EndHour == nil {
+				c.writeError(w, http.StatusBadRequest, "each schedule window requires start_hour and end_hour")
+				return
+			}
+			windows = append(windows, types.ScheduleWindow{StartHour: *win.StartHour, EndHour: *win.EndHour, Days: win.Days})
+		}
+		if len(windows) == 0 && (body.StartHour != nil || body.EndHour != nil) {
+			if body.StartHour == nil || body.EndHour == nil {
+				c.writeError(w, http.StatusBadRequest, "start_hour and end_hour must be provided together")
+				return
+			}
+			windows = []types.ScheduleWindow{{StartHour: *body.StartHour, EndHour: *body.EndHour}}
+		}
+		if len(windows) == 0 && (*body.Enabled || body.Windows != nil) {
+			c.writeError(w, http.StatusBadRequest, "provide at least one schedule window")
+			return
+		}
 		if err := updateSavedConfig(config.DefaultConfigPath(), func(cfg *types.Config) error {
-			if !body.Enabled {
-				cfg.Schedule.Enabled = false
-				if strings.TrimSpace(body.Timezone) != "" {
-					cfg.Schedule.Timezone = strings.TrimSpace(body.Timezone)
-				}
-				return nil
+			cfg.Schedule.Enabled = *body.Enabled
+			if body.Timezone != nil {
+				cfg.Schedule.Timezone = strings.TrimSpace(*body.Timezone)
 			}
-			windows := body.Windows
-			if len(windows) == 0 {
-				windows = []types.ScheduleWindow{{StartHour: body.StartHour, EndHour: body.EndHour}}
+			if len(windows) > 0 {
+				cfg.Schedule.Windows = windows
 			}
-			cfg.Schedule = config.NormalizeSchedule(types.ScheduleConfig{
-				Enabled:  true,
-				Timezone: strings.TrimSpace(body.Timezone),
-				Windows:  windows,
-			})
+			if err := config.ValidateSchedule(cfg.Schedule); err != nil {
+				return err
+			}
+			cfg.Schedule = config.NormalizeSchedule(cfg.Schedule)
 			return nil
 		}); err != nil {
 			c.writeError(w, http.StatusBadRequest, err.Error())
@@ -251,6 +281,19 @@ func (c *guiController) handler() http.Handler {
 		c.writeState(w)
 	})
 	return c.authorize(mux)
+}
+
+func decodeGUIRequest(w http.ResponseWriter, r *http.Request, value any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return fmt.Errorf("invalid request JSON: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("request must contain exactly one JSON object")
+	}
+	return nil
 }
 
 func (c *guiController) authorize(next http.Handler) http.Handler {
@@ -294,11 +337,19 @@ func (c *guiController) authorize(next http.Handler) http.Handler {
 func (c *guiController) startAgent() {
 	c.mu.Lock()
 	c.running = true
+	c.clients = nil
 	c.busy = ""
 	c.mu.Unlock()
-	err := c.withOutput(func() error { return cmdStart(nil) })
+	err := c.withOutput(func() error {
+		return cmdStartWithClients(nil, func(clients []*pool.Client) {
+			c.mu.Lock()
+			c.clients = clients
+			c.mu.Unlock()
+		})
+	})
 	c.mu.Lock()
 	c.running = false
+	c.clients = nil
 	c.busy = ""
 	c.mu.Unlock()
 	if err != nil {
@@ -396,8 +447,24 @@ func (c *guiController) snapshot() map[string]any {
 		timezone = cfg.Schedule.Timezone
 		windows = normalized.Windows
 	}
+	scheduleStatus := "Schedule allows work"
+	if !enrolled {
+		scheduleStatus = "Not enrolled"
+	} else if paused {
+		scheduleStatus = "Paused by you"
+	} else if earning.Mode == config.EarningScheduledOff {
+		scheduleStatus = "Outside scheduled hours"
+	}
 	if !c.running {
 		earning = config.EarningStatus{Mode: config.EarningStopped, Summary: "Enrolled — click Start to connect"}
+	}
+	connected := 0
+	if c.running {
+		for _, client := range c.clients {
+			if client.Connected() {
+				connected++
+			}
+		}
 	}
 	return map[string]any{
 		"version":           version,
@@ -407,7 +474,10 @@ func (c *guiController) snapshot() map[string]any {
 		"busy":              c.busy,
 		"paused":            paused,
 		"earning_mode":      earning.Mode,
-		"earning":           earning.Summary,
+		"earning":           scheduleStatus,
+		"schedule_status":   scheduleStatus,
+		"connected_workers": connected,
+		"total_workers":     len(c.clients),
 		"earning_next":      earning.NextLabel,
 		"schedule_enabled":  scheduleEnabled,
 		"schedule_start":    startHour,
