@@ -62,45 +62,44 @@ func TestReusableCIVerifiesReleaseRuntimePaths(t *testing.T) {
 	if _, ok := ci.On["workflow_call"]; !ok {
 		t.Fatal("CI must support workflow_call")
 	}
-	for jobName, requiredCommands := range map[string][]string{
-		"build":               {"go build -v ./...", "go vet ./...", "go test -v -count=1 -short ./...", "node --test gui_browser_test.mjs"},
-		"runtime-smoke":       {"docker version", "bash scripts/test-clean-ollama-linux.sh", "sudo bash scripts/install-ollama-linux.sh", "go test -v -count=1 -run '^TestRuntimeSmoke_' ./internal/job -timeout 20m"},
-		"macos-runtime-smoke": {"go test -v -count=1 -run '^TestRuntimeSmoke_NativeOllamaInference$' ./internal/job -timeout 15m"},
-	} {
-		job, ok := ci.Jobs[jobName]
-		if !ok || job.If != "" || job.ContinueOnError != nil {
-			t.Fatalf("%s must run for reusable CI without failure suppression", jobName)
+	if _, ok := ci.Jobs["runtime-smoke"]; ok {
+		t.Fatal("public CI must not run real-model inference jobs")
+	}
+	if _, ok := ci.Jobs["macos-runtime-smoke"]; ok {
+		t.Fatal("public CI must not run real-model inference jobs")
+	}
+	job, ok := ci.Jobs["build"]
+	if !ok || job.If != "" || job.ContinueOnError != nil {
+		t.Fatal("build must run for reusable CI without failure suppression")
+	}
+	requiredCommands := []string{"go build -v ./...", "go vet ./...", "go test -v -count=1 -short ./...", "node --test gui_browser_test.mjs"}
+	var commands []string
+	checkedOutSHA := false
+	nodeReady := false
+	for _, step := range job.Steps {
+		if step.If != "" || step.ContinueOnError != nil {
+			t.Fatal("build must not skip or suppress verification steps")
 		}
-		var commands []string
-		checkedOutSHA := false
-		nodeReady := false
-		for _, step := range job.Steps {
-			if step.If != "" || step.ContinueOnError != nil {
-				t.Fatalf("%s must not skip or suppress verification steps", jobName)
-			}
-			if strings.HasPrefix(step.Uses, "actions/checkout@") {
-				checkedOutSHA = step.With["ref"] == "${{ github.sha }}"
-			}
-			if strings.HasPrefix(step.Uses, "actions/setup-node@") {
-				nodeReady = step.With["node-version"] == "22"
-			}
-			if step.Run == "node --test gui_browser_test.mjs" && !nodeReady {
-				t.Fatal("browser regressions require Node 22 setup before execution")
-			}
-			commands = append(commands, step.Run)
-			if strings.Contains(step.Run, "go test") && strings.Contains(step.Run, "TestRuntimeSmoke_") {
-				if step.Env["RUNGPU_RUNTIME_SMOKE"] != "1" || strings.Contains(step.Run, "-short") {
-					t.Fatalf("%s must execute real runtime tests, not skip them", jobName)
-				}
-			}
+		if strings.HasPrefix(step.Uses, "actions/checkout@") {
+			checkedOutSHA = step.With["ref"] == "${{ github.sha }}"
 		}
-		if !checkedOutSHA {
-			t.Fatalf("%s must verify the immutable caller SHA", jobName)
+		if strings.HasPrefix(step.Uses, "actions/setup-node@") {
+			nodeReady = step.With["node-version"] == "22"
 		}
-		for _, command := range requiredCommands {
-			if !slices.Contains(commands, command) {
-				t.Errorf("%s missing required verification command %q", jobName, command)
-			}
+		if step.Run == "node --test gui_browser_test.mjs" && !nodeReady {
+			t.Fatal("browser regressions require Node 22 setup before execution")
+		}
+		if strings.Contains(step.Run, "TestRuntimeSmoke_") || step.Env["RUNGPU_RUNTIME_SMOKE"] == "1" {
+			t.Fatal("build must not run real-model inference")
+		}
+		commands = append(commands, step.Run)
+	}
+	if !checkedOutSHA {
+		t.Fatal("build must verify the immutable caller SHA")
+	}
+	for _, command := range requiredCommands {
+		if !slices.Contains(commands, command) {
+			t.Errorf("build missing required verification command %q", command)
 		}
 	}
 }
