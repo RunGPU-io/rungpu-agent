@@ -113,6 +113,15 @@ func TestOllamaJobDeadline(t *testing.T) {
 	})
 }
 
+func deadlineCacheDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), ".tokenize", "cache")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func deadlineDockerFixture(t *testing.T) (started, cleanup, release string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -175,7 +184,7 @@ func TestDockerRuntimeCleanup(t *testing.T) {
 	for _, owned := range []bool{false, true} {
 		t.Run(fmt.Sprintf("hung daemon owned=%t", owned), func(t *testing.T) {
 			started, cleanup, release := deadlineDockerFixture(t)
-			rt := newCustomDockerRuntime(t.TempDir(), false, "", time.Minute, dockermgr.DefaultPolicy())
+			rt := newCustomDockerRuntime(deadlineCacheDir(t), false, "", time.Minute, dockermgr.DefaultPolicy())
 			gate := &sync.RWMutex{}
 			e := &Executor{
 				cacheDir: rt.cacheDir, runtime: &skipPrepare{inner: rt}, executionGate: gate, jobTimeout: time.Minute,
@@ -243,7 +252,7 @@ func TestDockerRuntimeCleanup(t *testing.T) {
 		deadlineDockerFixture(t)
 		t.Setenv("DEADLINE_RUNNING", "false")
 		t.Setenv("DEADLINE_HANG", "false")
-		rt := newCustomDockerRuntime(t.TempDir(), false, "", time.Minute, dockermgr.DefaultPolicy())
+		rt := newCustomDockerRuntime(deadlineCacheDir(t), false, "", time.Minute, dockermgr.DefaultPolicy())
 		gate := &sync.RWMutex{}
 		e := &Executor{
 			cacheDir: rt.cacheDir, runtime: &skipPrepare{inner: rt}, executionGate: gate, jobTimeout: time.Minute,
@@ -265,7 +274,7 @@ func TestDockerRuntimeCleanup(t *testing.T) {
 		_, cleanup, _ := deadlineDockerFixture(t)
 		t.Setenv("DEADLINE_RUNNING", "false")
 		t.Setenv("DEADLINE_HANG", "error")
-		rt := newWorkspaceRuntime(t.TempDir(), false, "", dockermgr.DefaultPolicy())
+		rt := newWorkspaceRuntime(deadlineCacheDir(t), false, "", dockermgr.DefaultPolicy())
 		result, err := rt.Run(context.Background(), types.JobAssignment{
 			JobID: "workspace-cleanup-failure", Runtime: "workspace", DockerImage: "fixture-worker:latest",
 		})
