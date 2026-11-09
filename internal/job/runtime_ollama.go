@@ -17,6 +17,26 @@ import (
 
 const defaultOllamaEndpoint = "http://localhost:11434"
 
+type nativeCompletionContextKey struct{}
+
+type nativeCompletionProof struct {
+	jobID         string
+	dispatchToken string
+	completed     bool
+}
+
+func confirmNativeCompletion(ctx context.Context, a types.JobAssignment) error {
+	proof, _ := ctx.Value(nativeCompletionContextKey{}).(*nativeCompletionProof)
+	if proof == nil {
+		return nil
+	}
+	if proof.jobID != a.JobID || proof.dispatchToken != a.DispatchToken {
+		return fmt.Errorf("native completion does not match the execution attempt")
+	}
+	proof.completed = true
+	return nil
+}
+
 type ollamaRuntime struct {
 	cacheDir string
 	endpoint string
@@ -40,7 +60,8 @@ func newOllamaRuntime(cacheDir, hostBackend string) *ollamaRuntime {
 		cacheDir: cacheDir,
 		endpoint: defaultOllamaEndpoint,
 		backend:  backend,
-		client:   &http.Client{Timeout: 5 * time.Minute},
+
+		client: &http.Client{},
 	}
 }
 
@@ -134,6 +155,8 @@ func (r *ollamaRuntime) ensureServerRunning(ctx context.Context) error {
 }
 
 func (r *ollamaRuntime) isModelCached(ctx context.Context, model string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 	body, _ := json.Marshal(map[string]string{"name": model})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint+"/api/show", bytes.NewReader(body))
 	if err != nil {
@@ -227,6 +250,9 @@ func (r *ollamaRuntime) Run(ctx context.Context, a types.JobAssignment) (map[str
 	}
 	if !gen.Done {
 		return nil, fmt.Errorf("ollama response did not confirm generation completed")
+	}
+	if err := confirmNativeCompletion(ctx, a); err != nil {
+		return nil, err
 	}
 	return map[string]interface{}{
 		"status":     "completed",

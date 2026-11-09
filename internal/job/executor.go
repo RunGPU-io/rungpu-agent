@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,16 +36,23 @@ type Executor struct {
 }
 
 type execution struct {
-	dispatchToken   string
-	cancel          context.CancelFunc
-	done            chan struct{}
-	runtime         string
-	cancelRequested bool
-	stopConfirmed   bool
-	stopUnverified  bool
-	release         func()
-	resource        dockermgr.OwnedResource
-	restored        bool
+	dispatchToken    string
+	cancel           context.CancelFunc
+	done             chan struct{}
+	runtime          string
+	cancelRequested  bool
+	stopConfirmed    bool
+	stopUnverified   bool
+	nativeRunEntered bool
+	nativeCompleted  bool
+	release          func()
+	resource         dockermgr.OwnedResource
+	restored         bool
+}
+
+func (s *execution) nativeStopKnown() bool {
+	return s.runtime == "ollama" && !s.restored && !s.stopUnverified &&
+		(!s.nativeRunEntered || s.nativeCompleted)
 }
 
 var ErrAlreadyTracked = errors.New("job is already tracked")
@@ -266,7 +274,8 @@ func (e *Executor) Start(ctx context.Context, a types.JobAssignment) (<-chan typ
 		}
 		e.mu.Lock()
 		delete(e.inflight, a.JobID)
-		stopped := !e.workspaces[a.JobID] && !state.cancelRequested && !state.stopUnverified
+		stopped := !e.workspaces[a.JobID] && !state.stopUnverified &&
+			(!state.cancelRequested || state.nativeStopKnown())
 		if e.journal != nil {
 			if err := e.journal.Complete(a.JobID, a.DispatchToken, &result, stopped); err != nil {
 				state.stopUnverified = true
@@ -350,7 +359,30 @@ func (e *Executor) execute(ctx context.Context, a types.JobAssignment) types.Job
 	}
 
 	e.progress(a, "running", 0.5, "Running inference...")
+	var nativeProof *nativeCompletionProof
+	if a.Runtime == "ollama" {
+		e.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			res.Error = err.Error()
+			return res
+		}
+		if e.executions[a.JobID].cancelRequested {
+			e.mu.Unlock()
+			res.Error = context.Canceled.Error()
+			return res
+		}
+		e.executions[a.JobID].nativeRunEntered = true
+		e.mu.Unlock()
+		nativeProof = &nativeCompletionProof{jobID: a.JobID, dispatchToken: a.DispatchToken}
+		ctx = context.WithValue(ctx, nativeCompletionContextKey{}, nativeProof)
+	}
 	out, err := e.runtime.Run(ctx, a)
+	if nativeProof != nil && nativeProof.completed {
+		e.mu.Lock()
+		e.executions[a.JobID].nativeCompleted = true
+		e.mu.Unlock()
+	}
 	if workspace && err == nil {
 
 		e.mu.Lock()
@@ -361,7 +393,7 @@ func (e *Executor) execute(ctx context.Context, a types.JobAssignment) types.Job
 		e.mu.Unlock()
 	}
 	if e.executionGate != nil || e.journal != nil {
-		if a.Runtime == "ollama" && err != nil {
+		if a.Runtime == "ollama" && err != nil && !nativeProof.completed {
 			e.markStopUnverified(a.JobID)
 			err = fmt.Errorf("%w; native backend stop cannot be verified; machine remains reserved", err)
 		} else if a.Runtime != "ollama" && (!workspace || err != nil) {
@@ -397,6 +429,7 @@ func (e *Executor) execute(ctx context.Context, a types.JobAssignment) types.Job
 			return res
 		}
 		out["uploaded"] = true
+		out["filename"] = filepath.Base(outputPath)
 		if info, statErr := os.Stat(outputPath); statErr == nil {
 			out["output_size_bytes"] = info.Size()
 			out["output_content_type"] = outputContentType(outputPath)
@@ -565,10 +598,15 @@ func (e *Executor) cancelContext(ctx context.Context, jobID string, dispatchToke
 		return errors.Join(fmt.Errorf("waiting for job execution to stop: %w", ctx.Err()), teardownErr)
 	}
 	if !dockerRuntime && !knownUnstarted {
-		return fmt.Errorf("runtime %q cannot confirm backend execution stopped", state.runtime)
+		e.mu.Lock()
+		nativeStopped := state.nativeStopKnown()
+		e.mu.Unlock()
+		if !nativeStopped {
+			return fmt.Errorf("runtime %q cannot confirm backend execution stopped", state.runtime)
+		}
 	}
 
-	if !knownUnstarted {
+	if dockerRuntime && !knownUnstarted {
 		if err := errors.Join(teardownErr, remove()); err != nil {
 			return fmt.Errorf("job teardown could not be verified: %w", err)
 		}

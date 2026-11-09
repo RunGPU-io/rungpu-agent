@@ -2,6 +2,7 @@ package job
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -168,12 +169,11 @@ func (r *workspaceRuntime) Run(ctx context.Context, a types.JobAssignment) (map[
 	running, _, err := r.docker.Inspect(ctx, containerName)
 	if err != nil || !running {
 		logs, _ := r.docker.Logs(ctx, containerName, 50)
-		if a.ResourceName != "" {
-			_ = r.docker.RemoveOwnedAndVerify(context.Background(), dockermgr.OwnedResource{Name: containerName, Labels: a.ResourceLabels, DaemonID: a.ResourceDaemonID})
-		} else {
-			_ = r.docker.Remove(context.Background(), containerName)
+		cleanupErr := cleanupRuntimeContainer(r.docker, a, containerName)
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("workspace cleanup could not be verified: %w", cleanupErr)
 		}
-		return nil, fmt.Errorf("workspace container failed to start:\n%s", logs)
+		return nil, errors.Join(fmt.Errorf("workspace container failed to start:\n%s", logs), cleanupErr)
 	}
 
 	accessURLs := make([]string, 0, len(ports))

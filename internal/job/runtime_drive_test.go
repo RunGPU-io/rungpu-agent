@@ -141,6 +141,9 @@ func TestCollectDriveOutputPrefersMediaFile(t *testing.T) {
 	if filepath.Base(output) != "out.png" {
 		t.Fatalf("output_file = %q", output)
 	}
+	if got["filename"] != "out.png" {
+		t.Fatalf("display filename is missing or contains a host path: %v", got["filename"])
+	}
 }
 
 type recordingRuntime struct {

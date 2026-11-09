@@ -162,6 +162,7 @@ func (r *customDockerRuntime) collectDriveOutput(img, outputDir string) (map[str
 	}
 	if outputFile := findOutputFile(outputDir); outputFile != "" {
 		parsed["output_file"] = outputFile
+		parsed["filename"] = filepath.Base(outputFile)
 		return parsed, nil
 	}
 	return nil, fmt.Errorf("drive script produced no file under /output")

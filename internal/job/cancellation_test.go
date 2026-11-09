@@ -239,8 +239,10 @@ func TestVerifiedCancellationTimeoutDoesNotClaimStop(t *testing.T) {
 }
 
 func TestVerifiedCancellationRejectsNativeBackendProof(t *testing.T) {
+	started := make(chan struct{})
 	e := &Executor{cacheDir: t.TempDir(), runtime: &cancellationRuntime{
 		run: func(ctx context.Context) (map[string]interface{}, error) {
+			close(started)
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
@@ -252,6 +254,7 @@ func TestVerifiedCancellationRejectsNativeBackendProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	<-started
 	if err := e.Cancel("native"); err == nil || !strings.Contains(err.Error(), "cannot confirm backend") {
 		t.Fatalf("native cancellation must be negative: %v", err)
 	}

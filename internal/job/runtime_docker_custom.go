@@ -23,6 +23,19 @@ type customDockerRuntime struct {
 	jobTimeout time.Duration
 }
 
+const runtimeContainerCleanupTimeout = 30 * time.Second
+
+func cleanupRuntimeContainer(manager *dockermgr.Manager, a types.JobAssignment, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeContainerCleanupTimeout)
+	defer cancel()
+	if a.ResourceName != "" {
+		return manager.RemoveOwnedAndVerify(ctx, dockermgr.OwnedResource{
+			Name: name, Labels: a.ResourceLabels, DaemonID: a.ResourceDaemonID,
+		})
+	}
+	return manager.RemoveAndVerify(ctx, name)
+}
+
 func newCustomDockerRuntime(cacheDir string, useGPU bool, gpuDevice string, jobTimeout time.Duration, policy dockermgr.SecurityPolicy) *customDockerRuntime {
 	if jobTimeout <= 0 {
 		jobTimeout = 60 * time.Minute
@@ -141,11 +154,9 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 	}
 
 	defer func() {
-		if a.ResourceName != "" {
-			_ = r.docker.RemoveOwnedAndVerify(context.Background(), dockermgr.OwnedResource{Name: containerName, Labels: a.ResourceLabels, DaemonID: a.ResourceDaemonID})
-		} else {
-			_ = r.docker.Stop(context.Background(), containerName)
-			_ = r.docker.Remove(context.Background(), containerName)
+
+		if err := cleanupRuntimeContainer(r.docker, a, containerName); err != nil {
+			fmt.Printf("[runtime] Container cleanup could not be verified: %v\n", err)
 		}
 	}()
 
@@ -187,6 +198,7 @@ func (r *customDockerRuntime) Run(ctx context.Context, a types.JobAssignment) (m
 
 	if outputFile := findOutputFile(outputDir); outputFile != "" {
 		parsed["output_file"] = outputFile
+		parsed["filename"] = filepath.Base(outputFile)
 	}
 
 	return parsed, nil
